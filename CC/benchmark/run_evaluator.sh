@@ -22,17 +22,24 @@ if [ ! -f "$INPUT_FILE" ]; then
     exit 1
 fi
 
-# If input file is not in current directory, copy it
+# Use a temporary filename for the implementation source code
+TEMP_CC_FILE="CCImplementationTemp.java"
+
+# If input file is not 'CCImplementationTemp.java', copy it for compilation
 INPUT_BASENAME=$(basename "$INPUT_FILE")
-if [ "$INPUT_FILE" != "$INPUT_BASENAME" ] && [ "$INPUT_FILE" != "./$INPUT_BASENAME" ]; then
-    cp "$INPUT_FILE" "$INPUT_BASENAME"
+if [ "$INPUT_BASENAME" != "$TEMP_CC_FILE" ]; then
+    cp "$INPUT_FILE" "$TEMP_CC_FILE"
+else
+    # Already the correct temp file
+    :
 fi
 
 echo "Compiling Java files..."
-javac -d . KVStore.java InitialProgram.java Evaluator.java
+javac -d . KVStore.java Concurrency.java "$TEMP_CC_FILE" Evaluator.java
 
 if [ $? -ne 0 ]; then
     echo "Error: Compilation failed"
+    rm -f "$TEMP_CC_FILE"
     exit 1
 fi
 
@@ -45,10 +52,13 @@ if [ $? -eq 0 ]; then
     cat "$OUTPUT_FILE"
 else
     echo "Error: Evaluation failed"
+    rm -f "$TEMP_CC_FILE"
     exit 1
 fi
 
-
-
+# Clean up the temporary copy if it was created here
+if [ "$INPUT_BASENAME" != "$TEMP_CC_FILE" ]; then
+    rm -f "$TEMP_CC_FILE"
+fi
 
 

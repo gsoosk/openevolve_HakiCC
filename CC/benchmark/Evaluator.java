@@ -26,7 +26,7 @@ public class Evaluator {
     static class Op {
         final int seq;
         final int txid;
-        final char kind;  // 'R' or 'W'
+        final char kind;  // 'R' = Read, 'W' = Write, 'I' = Increment, 'D' = Decrement
         final String key;
 
         Op(int seq, int txid, char kind, String key) {
@@ -40,18 +40,21 @@ public class Evaluator {
     // ---------- MockKVStore ----------
     
     /**
-     * Store wrapper that logs get/put operations at the time they actually hit storage.
+     * Store wrapper that logs get/update/increment/decrement operations at the time they actually hit storage.
      * Uses thread-local binding to attribute operations to the current transaction ID.
      */
     static class MockKVStore extends KVStore {
-        private final BiConsumer<Integer, String> onGet;
-        private final BiConsumer<Integer, String> onPut;
+        private final TriConsumer<Integer, String, Character> onOp;  // (txid, key, opKind)
         private final Supplier<Integer> getTxid;
         private final ThreadLocal<Integer> tls = new ThreadLocal<>();
 
-        MockKVStore(BiConsumer<Integer, String> onGet, BiConsumer<Integer, String> onPut, Supplier<Integer> getTxid) {
-            this.onGet = onGet;
-            this.onPut = onPut;
+        @FunctionalInterface
+        interface TriConsumer<A, B, C> {
+            void accept(A a, B b, C c);
+        }
+
+        MockKVStore(TriConsumer<Integer, String, Character> onOp, Supplier<Integer> getTxid) {
+            this.onOp = onOp;
             this.getTxid = getTxid;
         }
 
@@ -63,31 +66,61 @@ public class Evaluator {
             return tls.get();
         }
 
-        @Override
-        public Object get(String key) {
-            Object val = super.get(key);
+        private void logOp(String key, char kind) {
             Integer txid = currentTxid();
             if (txid == null) {
                 txid = getTxid.get();
             }
             if (txid != null && txid >= 0) {
-                onGet.accept(txid, key);
+                onOp.accept(txid, key, kind);
             }
+        }
+
+        @Override
+        public Object get(String key) {
+            Object val = super.get(key);
+            logOp(key, 'R');
             return val;
         }
 
         @Override
-        public void put(Map<String, Object> writes) {
-            Integer txid = currentTxid();
-            if (txid == null) {
-                txid = getTxid.get();
+        public Object insert(String key, Object value) {
+            logOp(key, 'W');
+            return super.insert(key, value);
+        }
+
+        @Override
+        public Object update(String key, Object value) {
+            logOp(key, 'W');
+            return super.update(key, value);
+        }
+
+        @Override
+        public Long increment(String key, long delta) {
+            logOp(key, 'I');
+            return super.increment(key, delta);
+        }
+
+        @Override
+        public Long decrement(String key, long delta) {
+            logOp(key, 'D');
+            return super.decrement(key, delta);
+        }
+
+        @Override
+        public Object delete(String key) {
+            logOp(key, 'W');
+            return super.delete(key);
+        }
+
+        /**
+         * Convenience method to update multiple key-value pairs.
+         * Used by CC implementations to apply write sets at commit time.
+         */
+        public void updateAll(Map<String, Object> writes) {
+            for (Map.Entry<String, Object> entry : writes.entrySet()) {
+                update(entry.getKey(), entry.getValue());
             }
-            if (txid != null && txid >= 0) {
-                for (String k : writes.keySet()) {
-                    onPut.accept(txid, k);
-                }
-            }
-            super.put(writes);
         }
     }
 
@@ -146,19 +179,14 @@ public class Evaluator {
             this.stallThresholdS = stallThresholdS;
             this.progressSlots = new AtomicLongArray(numWorkers);
 
-            BiConsumer<Integer, String> onGet = (txid, key) -> {
+            MockKVStore.TriConsumer<Integer, String, Character> onOp = (txid, key, kind) -> {
                 int seqNum = globalSeq.incrementAndGet();
-                tlsOps.get().add(new Op(seqNum, txid, 'R', key));
-            };
-
-            BiConsumer<Integer, String> onPut = (txid, key) -> {
-                int seqNum = globalSeq.incrementAndGet();
-                tlsOps.get().add(new Op(seqNum, txid, 'W', key));
+                tlsOps.get().add(new Op(seqNum, txid, kind, key));
             };
 
             Supplier<Integer> getTxid = () -> tlsTxnTxid.get();
 
-            this.store = new MockKVStore(onGet, onPut, getTxid);
+            this.store = new MockKVStore(onOp, getTxid);
             this.cc = ccFactory.get();
         }
 
@@ -459,6 +487,19 @@ public class Evaluator {
     /**
      * Parallel version - processes each key independently in parallel.
      * Assumes ops are only from committed txns and in increasing seq order.
+     * 
+     * Conflict/Commutativity matrix for same item X, different transactions:
+     * 
+     *   op1 \ op2  |  R(X)  |  W(X)  |  Δ(X)=INC/DEC
+     *   ---------- | ------ | ------ | -------------
+     *   R(X)       |   no   |  yes   |     yes
+     *   W(X)       |  yes   |  yes   |     yes
+     *   Δ(X)       |  yes   |  yes   |  no (commutative)
+     * 
+     * State per item:
+     * - lastSetW: last normal write (set/assign) txid and seq
+     * - deltaWriters: set of txns that did INC/DEC since lastSetW
+     * - readers: set of txns that read since last reset
      */
     static GraphResult buildPrecedenceGraphFast(List<Op> ops) {
         // Collect all txids for graph nodes
@@ -488,40 +529,105 @@ public class Evaluator {
                 String key = entry.getKey();
                 List<Op> keyOps = entry.getValue();
                 
-                // Local state for this key
-                Integer lastWriter = null;
-                Integer lastWriterSeq = null;
-                Map<Integer, Integer> readers = new HashMap<>();
+                // State for this key
+                Integer lastSetW = null;           // txid of last normal write (W)
+                Integer lastSetWSeq = null;        // seq of last normal write
+                Map<Integer, Integer> deltaWriters = new HashMap<>();  // txid -> first delta seq since lastSetW
+                Map<Integer, Integer> readers = new HashMap<>();       // txid -> first read seq since last reset
                 
                 for (Op op : keyOps) {
                     if (op.kind == 'R') {
-                        if (lastWriter != null && lastWriter != op.txid) {
-                            graph.computeIfAbsent(lastWriter, k -> ConcurrentHashMap.newKeySet()).add(op.txid);  // W→R
-                            long ek = GraphResult.edgeKey(lastWriter, op.txid);
+                        // R_i(X): Read operation
+                        
+                        // Edge from lastSetW → i (normal write before read)
+                        if (lastSetW != null && lastSetW != op.txid) {
+                            graph.computeIfAbsent(lastSetW, k -> ConcurrentHashMap.newKeySet()).add(op.txid);
+                            long ek = GraphResult.edgeKey(lastSetW, op.txid);
                             evidence.computeIfAbsent(ek, k -> Collections.synchronizedList(new ArrayList<>()))
-                                    .add(new Evidence(key, 0, lastWriterSeq != null ? lastWriterSeq : -1, op.seq));
+                                    .add(new Evidence(key, 0, lastSetWSeq != null ? lastSetWSeq : -1, op.seq));
                         }
+                        
+                        // Edges from all deltaWriters → i (deltas before read)
+                        for (Map.Entry<Integer, Integer> deltaEntry : deltaWriters.entrySet()) {
+                            int k = deltaEntry.getKey();
+                            int kseq = deltaEntry.getValue();
+                            if (k != op.txid) {
+                                graph.computeIfAbsent(k, x -> ConcurrentHashMap.newKeySet()).add(op.txid);
+                                long ek = GraphResult.edgeKey(k, op.txid);
+                                evidence.computeIfAbsent(ek, x -> Collections.synchronizedList(new ArrayList<>()))
+                                        .add(new Evidence(key, 3, kseq, op.seq));  // 3 = Δ→R
+                            }
+                        }
+                        
                         readers.putIfAbsent(op.txid, op.seq);
-                    } else {  // 'W'
-                        if (lastWriter != null && lastWriter != op.txid) {
-                            graph.computeIfAbsent(lastWriter, k -> ConcurrentHashMap.newKeySet()).add(op.txid);  // W→W
-                            long ek = GraphResult.edgeKey(lastWriter, op.txid);
+                        
+                    } else if (op.kind == 'I' || op.kind == 'D') {
+                        // Δ_i(X): Delta operation (INC/DEC)
+                        
+                        // Edge from lastSetW → i (normal write before delta)
+                        if (lastSetW != null && lastSetW != op.txid) {
+                            graph.computeIfAbsent(lastSetW, k -> ConcurrentHashMap.newKeySet()).add(op.txid);
+                            long ek = GraphResult.edgeKey(lastSetW, op.txid);
                             evidence.computeIfAbsent(ek, k -> Collections.synchronizedList(new ArrayList<>()))
-                                    .add(new Evidence(key, 1, lastWriterSeq != null ? lastWriterSeq : -1, op.seq));
+                                    .add(new Evidence(key, 1, lastSetWSeq != null ? lastSetWSeq : -1, op.seq));
                         }
+                        
+                        // Edges from all readers → i (read before delta)
                         for (Map.Entry<Integer, Integer> readerEntry : readers.entrySet()) {
                             int r = readerEntry.getKey();
                             int rseq = readerEntry.getValue();
                             if (r != op.txid) {
-                                graph.computeIfAbsent(r, k -> ConcurrentHashMap.newKeySet()).add(op.txid);  // R→W
+                                graph.computeIfAbsent(r, k -> ConcurrentHashMap.newKeySet()).add(op.txid);
+                                long ek = GraphResult.edgeKey(r, op.txid);
+                                evidence.computeIfAbsent(ek, k -> Collections.synchronizedList(new ArrayList<>()))
+                                        .add(new Evidence(key, 2, rseq, op.seq));  // 2 = R→Δ
+                            }
+                        }
+                        
+                        // Do NOT add edges from deltaWriters (Δ–Δ is commutative!)
+                        
+                        deltaWriters.putIfAbsent(op.txid, op.seq);
+                        
+                    } else {  // 'W' - normal write (assignment/overwrite)
+                        // W_i(X): Normal write operation
+                        
+                        // Edge from lastSetW → i (WW conflict)
+                        if (lastSetW != null && lastSetW != op.txid) {
+                            graph.computeIfAbsent(lastSetW, k -> ConcurrentHashMap.newKeySet()).add(op.txid);
+                            long ek = GraphResult.edgeKey(lastSetW, op.txid);
+                            evidence.computeIfAbsent(ek, k -> Collections.synchronizedList(new ArrayList<>()))
+                                    .add(new Evidence(key, 1, lastSetWSeq != null ? lastSetWSeq : -1, op.seq));
+                        }
+                        
+                        // Edges from all readers → i (RW conflict)
+                        for (Map.Entry<Integer, Integer> readerEntry : readers.entrySet()) {
+                            int r = readerEntry.getKey();
+                            int rseq = readerEntry.getValue();
+                            if (r != op.txid) {
+                                graph.computeIfAbsent(r, k -> ConcurrentHashMap.newKeySet()).add(op.txid);
                                 long ek = GraphResult.edgeKey(r, op.txid);
                                 evidence.computeIfAbsent(ek, k -> Collections.synchronizedList(new ArrayList<>()))
                                         .add(new Evidence(key, 2, rseq, op.seq));
                             }
                         }
-                        lastWriter = op.txid;
-                        lastWriterSeq = op.seq;
+                        
+                        // Edges from all deltaWriters → i (Δ before overwrite)
+                        for (Map.Entry<Integer, Integer> deltaEntry : deltaWriters.entrySet()) {
+                            int k = deltaEntry.getKey();
+                            int kseq = deltaEntry.getValue();
+                            if (k != op.txid) {
+                                graph.computeIfAbsent(k, x -> ConcurrentHashMap.newKeySet()).add(op.txid);
+                                long ek = GraphResult.edgeKey(k, op.txid);
+                                evidence.computeIfAbsent(ek, x -> Collections.synchronizedList(new ArrayList<>()))
+                                        .add(new Evidence(key, 4, kseq, op.seq));  // 4 = Δ→W
+                            }
+                        }
+                        
+                        // Reset state for this key
                         readers.clear();
+                        deltaWriters.clear();
+                        lastSetW = op.txid;
+                        lastSetWSeq = op.seq;
                     }
                 }
             })).get();
@@ -738,6 +844,8 @@ public class Evaluator {
             case 0: return "W→R";
             case 1: return "W→W";
             case 2: return "R→W";
+            case 3: return "Δ→R";
+            case 4: return "Δ→W";
             default: return "?";
         }
     }
@@ -810,39 +918,36 @@ public class Evaluator {
     static final int TPCC_INITIAL_YTD = 0;
 
     static void initTpccData(KVStore store) {
-        Map<String, Object> writes = new HashMap<>();
         Random rand = new Random(42);  // Fixed seed for reproducibility
 
         // Initialize warehouses
         for (int wid = 1; wid <= TPCC_NUM_WAREHOUSES; wid++) {
-            writes.put("w_" + wid + "_ytd", TPCC_INITIAL_YTD);
+            store.insert("w_" + wid + "_ytd", TPCC_INITIAL_YTD);
 
             // Initialize districts per warehouse
             for (int did = 1; did <= TPCC_DISTRICTS_PER_WH; did++) {
-                writes.put("d_" + wid + "_" + did + "_ytd", TPCC_INITIAL_YTD);
-                writes.put("d_" + wid + "_" + did + "_next_oid", 1);
+                store.insert("d_" + wid + "_" + did + "_ytd", TPCC_INITIAL_YTD);
+                store.insert("d_" + wid + "_" + did + "_next_oid", 1);
 
                 // Initialize customers per district
                 for (int cid = 1; cid <= TPCC_CUSTOMERS_PER_DIST; cid++) {
-                    writes.put("c_" + wid + "_" + did + "_" + cid + "_bal", TPCC_INITIAL_BALANCE);
-                    writes.put("c_" + wid + "_" + did + "_" + cid + "_ytd", TPCC_INITIAL_YTD);
+                    store.insert("c_" + wid + "_" + did + "_" + cid + "_bal", TPCC_INITIAL_BALANCE);
+                    store.insert("c_" + wid + "_" + did + "_" + cid + "_ytd", TPCC_INITIAL_YTD);
                 }
             }
         }
 
         // Initialize items (global, not per-warehouse)
         for (int iid = 1; iid <= TPCC_NUM_ITEMS; iid++) {
-            writes.put("item_" + iid + "_price", rand.nextInt(9901) + 100);  // 100-10000
+            store.insert("item_" + iid + "_price", rand.nextInt(9901) + 100);  // 100-10000
         }
 
         // Initialize stock per warehouse per item
         for (int wid = 1; wid <= TPCC_NUM_WAREHOUSES; wid++) {
             for (int iid = 1; iid <= TPCC_NUM_ITEMS; iid++) {
-                writes.put("s_" + wid + "_" + iid + "_qty", TPCC_INITIAL_STOCK);
+                store.insert("s_" + wid + "_" + iid + "_qty", TPCC_INITIAL_STOCK);
             }
         }
-
-        store.put(writes);
     }
 
     static boolean tpccNewOrder(ConcurrentRunner r, Transaction txn) {
@@ -983,7 +1088,7 @@ public class Evaluator {
             Map<String, Object> map = new LinkedHashMap<>();
             map.put("committed", committed);
             map.put("stalled_threads", stalledThreads);
-            map.put("has_cycle", hasCycle);
+            map.put("is_serializable", !hasCycle);
             map.put("ops", ops);
             map.put("throughput", throughput);
             map.put("avg_read_time_nanos", avgReadTimeNanos);
@@ -996,6 +1101,7 @@ public class Evaluator {
             return map;
         }
     }
+    static final int MAX_OPS_TO_VERIFY = 50000;
 
     static ScenarioResult runScenario(
             Supplier<ConcurrencyControl> ccFactory,
@@ -1015,11 +1121,12 @@ public class Evaluator {
 
 
         List<Op> opsToUse;
-        if (result.ops.size() > 100000) {
-            opsToUse = result.ops.subList(result.ops.size() - 100000, result.ops.size());
+        if (result.ops.size() > MAX_OPS_TO_VERIFY) {
+            opsToUse = result.ops.subList(result.ops.size() - MAX_OPS_TO_VERIFY, result.ops.size());
         } else {
             opsToUse = result.ops;
         }
+        System.out.println("Ops to use: " + opsToUse.size());
         GraphResult graphResult = buildPrecedenceGraphFast(opsToUse);
         System.out.println("Precedence graph built");
         
@@ -1038,12 +1145,12 @@ public class Evaluator {
                 result.avgRollbackTimeNanos
         );
 
-        // if (hasCycle) {
-        //     String cycleExplanation = explainCycleKahn(graphResult.graph, graphResult.evidence, result.ops);
-        //     if (cycleExplanation.length() < 1000) {  
-        //         scenario.cycleExplanation = explainCycleKahn(graphResult.graph, graphResult.evidence, result.ops);
-        //     }
-        // }
+        if (hasCycle) {
+            String cycleExplanation = explainCycleKahn(graphResult.graph, graphResult.evidence, result.ops);
+            if (cycleExplanation.length() < 1000) {  
+                scenario.cycleExplanation = cycleExplanation;
+            }
+        }
 
         return scenario;
     }
@@ -1071,8 +1178,8 @@ public class Evaluator {
         try {
             Map<String, ScenarioResult> scenarios = new LinkedHashMap<>();
 
-            scenarios.put("counters", runScenario(ccFactory, Evaluator::wlCounter, 64, 10.0, 0.5, null));
-            scenarios.put("bank", runScenario(ccFactory, Evaluator::wlBank, 64, 1.0, 0.5, null));
+            scenarios.put("counters", runScenario(ccFactory, Evaluator::wlCounter, 64, 5.0, 0.5, null));
+            scenarios.put("bank", runScenario(ccFactory, Evaluator::wlBank, 64, 5.0, 0.5, null));
             scenarios.put("deadlock", runScenario(ccFactory, Evaluator::wlDeadlockProne, 64, 5.0, 0.2, null));
             scenarios.put("tpcc", runScenario(ccFactory, Evaluator::wlTpcc, 64, 5.0, 0.5, Evaluator::initTpccData));
 
@@ -1119,9 +1226,9 @@ public class Evaluator {
 
             Map<String, Object> metrics = new LinkedHashMap<>();
             metrics.put("correctness", correctness);
-            metrics.put("average_throughput", avgThroughput);
+            metrics.put("throughput_score", throughputScore);
             metrics.put("combined_score", combinedScore);
-            metrics.put("tpcc_throughput", throughputs.get("tpcc"));
+            metrics.put("pre_known_transactions_throughput", throughputs.get("tpcc"));
 
             Map<String, Object> scenarioSummaries = new LinkedHashMap<>();
             for (Map.Entry<String, ScenarioResult> entry : scenarios.entrySet()) {
@@ -1134,6 +1241,7 @@ public class Evaluator {
             return new EvaluationResult(metrics, artifacts);
 
         } catch (Exception e) {
+            e.printStackTrace();
             Map<String, Object> metrics = new LinkedHashMap<>();
             metrics.put("correctness", 0.0);
             metrics.put("throughput", 0.0);
