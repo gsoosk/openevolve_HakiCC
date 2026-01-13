@@ -1,6 +1,7 @@
 max_iterations: 20
 checkpoint_interval: 2
 log_level: "INFO"
+suffix: ".java"
 
 # LLM configuration
 llm:
@@ -11,7 +12,7 @@ llm:
   temperature: 0.7
   max_tokens: 120000
 
-  timeout: 200                         # Timeout for API requests in seconds
+  timeout: 400                         # Timeout for API requests in seconds
   retries: 3                          # Number of retries for failed requests
   retry_delay: 5    
 
@@ -20,17 +21,15 @@ prompt:
   system_message: |
     You are an expert researcher in **transactional concurrency control**.
 
-    Your task is to implement and iteratively improve a **concurrency control
-    (CC) algorithm** for an in-memory versioned key–value store. 
-    If you think the current impelemtnation can be improved, you can modify the whole protocol to something better. 
-
+    Your task is to optimize and iteratively improve a **concurrency control (CC) algorithm** specifically for a pre-known transactions workload. 
+     
     The evaluator will run many concurrent workloads against your CC
-    implementation, log the actual get/put operations that hit the storage
+    implementation, log the actual get/put/increment/decrement/delete operations that hit the storage
     engine, and construct a precedence graph to check **conflict-serializability**
     and **progress** (no stalled threads under deadlock-prone workloads).
 
     The only code the system will evolve is inside the `EVOLVE-BLOCK` in
-    `initial_program.py`, where a class derived from `ConcurrencyControl` is
+    `InitialProgram.java`, where a class derived from `ConcurrencyControl` is
     defined (e.g. `GeneratedCC`). Do NOT modify any code outside the evolve
     block.
 
@@ -53,10 +52,14 @@ prompt:
           * `write(self, txn: Transaction, key: str, value: Any, store: VersionedKVStore) -> None`
           * `commit(self, txn: Transaction, store: VersionedKVStore) -> CommitResult`
           * `rollback(self, txn: Transaction, store: VersionedKVStore) -> None`
-      - A `VersionedKVStore` that you must treat as an opaque storage engine and
+      - A `KVStore` that you must treat as an opaque storage engine and
         only access via:
-          * `get(key: str, ts: int) -> Optional[Any]`
-          * `put(writes: Dict[str, Any], commit_ts: int) -> None`
+          *  get(key): O(1) lookup
+          *  insert(key, value): O(1) insert 
+          *  update(key, value): O(1) update
+          *  increment(key, delta): O(1) atomic increment (for Numeric values)
+          *  decrement(key, delta): O(1) atomic decrement (for Numeric values)
+          *  delete(key): O(1) removal
 
     Additionally, a factory function `build_cc() -> ConcurrencyControl` is
     defined outside the evolve block; you should **not** change its signature,
@@ -65,22 +68,25 @@ prompt:
 
     The evaluator will:
       - Create a fresh CC instance via `build_cc()`
-      - Run several concurrent workloads (counters, bank transfers, deadlock-
-        prone key ordering)
+      - Run several concurrent workloads 
       - Build a precedence graph over committed transactions and check for
         **cycles** (non-serializable behavior)
       - Detect stalled threads under the deadlock-prone workload
       - Compute metrics:
           * `correctness`: fraction of scenarios that are serializable (no cycles)
             and, for the deadlock workload, also stall-free
-          * `throughput`: average committed transactions per second
-          * `combined_score`: weighted combination, heavily favoring correctness
+          * `throughput_score`: average committed transactions per second
+          * `pre_known_transactions_throughput`: average committed transactions per second for the pre-known transactions workload. This is the most important workload to achieve high throughput on.
+          * `combined_score`: weighted combination of correctness and throughput and pre-known transactions throughput. 
+        
 
-    Design your CC algorithm so that:
+    Optimize your CC algorithm so that:
       - It never exposes non-serializable histories (no precedence cycles over
         committed transactions).
       - It handles the deadlock-prone workload without leaving threads stalled.
       - It achieves as high a throughput as possible on multi-core machines.
+      - It achieves as high a throughput as possible on the pre-known transactions workload.
+      - Your CC algorithm MUST call KVStore methods to interact with the storage engine and persist the changes. DO NOT BYPASS THE KVStore methods to improve scores. 
 
     You may:
       - Maintain per-transaction metadata in `txn.meta`.
@@ -90,16 +96,174 @@ prompt:
         long as they use only the provided interfaces to interact with storage.
 
     Do NOT:
-      - Modify `VersionedKVStore` or rely on its internals.
+      - Modify `KVStore` or rely on its internals.
       - Change the signatures of `begin`, `read`, `write`, `commit`, `rollback`,
         or `build_cc`.
+
+    Pre-known transactions workload:
+      ```java
+        // ---------- TPC-C Workload ----------
+
+        static final int TPCC_NUM_WAREHOUSES = 8;
+        static final int TPCC_DISTRICTS_PER_WH = 10;
+        static final int TPCC_CUSTOMERS_PER_DIST = 100;
+        static final int TPCC_NUM_ITEMS = 1000;
+        static final int TPCC_INITIAL_STOCK = 100;
+        static final int TPCC_INITIAL_BALANCE = 10000;
+        static final int TPCC_INITIAL_YTD = 0;
+
+        // Initializes the TPCC dataset on the provided key-value store.
+        static void initTpccData(KVStore store) {
+            java.util.Random rand = new java.util.Random(42);  // Fixed seed for reproducibility
+
+            // Initialize warehouses
+            for (int wid = 1; wid <= TPCC_NUM_WAREHOUSES; wid++) {
+                store.insert("w_" + wid + "_ytd", TPCC_INITIAL_YTD);
+
+                // Initialize districts per warehouse
+                for (int did = 1; did <= TPCC_DISTRICTS_PER_WH; did++) {
+                    store.insert("d_" + wid + "_" + did + "_ytd", TPCC_INITIAL_YTD);
+                    store.insert("d_" + wid + "_" + did + "_next_oid", 1);
+
+                    // Initialize customers per district
+                    for (int cid = 1; cid <= TPCC_CUSTOMERS_PER_DIST; cid++) {
+                        store.insert("c_" + wid + "_" + did + "_" + cid + "_bal", TPCC_INITIAL_BALANCE);
+                        store.insert("c_" + wid + "_" + did + "_" + cid + "_ytd", TPCC_INITIAL_YTD);
+                    }
+                }
+            }
+
+            // Initialize items (global, not per-warehouse)
+            for (int iid = 1; iid <= TPCC_NUM_ITEMS; iid++) {
+                store.insert("item_" + iid + "_price", rand.nextInt(9901) + 100); // 100-10000
+            }
+
+            // Initialize stock per warehouse per item
+            for (int wid = 1; wid <= TPCC_NUM_WAREHOUSES; wid++) {
+                for (int iid = 1; iid <= TPCC_NUM_ITEMS; iid++) {
+                    store.insert("s_" + wid + "_" + iid + "_qty", TPCC_INITIAL_STOCK);
+                }
+            }
+        }
+
+        // Issues a new order transaction for TPC-C using the ConcurrencyControl interface.
+        static boolean tpccNewOrder(ConcurrencyControl cc, Transaction tx, KVStore store) {
+            java.util.Random rand = java.util.concurrent.ThreadLocalRandom.current();
+
+            int wid = rand.nextInt(TPCC_NUM_WAREHOUSES) + 1;
+            int did = rand.nextInt(TPCC_DISTRICTS_PER_WH) + 1;
+            int cid = rand.nextInt(TPCC_CUSTOMERS_PER_DIST) + 1;
+
+            // Read and update district's next order ID
+            String nextOidKey = "d_" + wid + "_" + did + "_next_oid";
+            Object nextOidObj = cc.read(tx, nextOidKey, store);
+            int nextOid = (nextOidObj instanceof Integer) ? (Integer) nextOidObj : 1;
+            cc.write(tx, nextOidKey, nextOid + 1, store);
+            int oid = nextOid;
+
+            // Read customer balance (not used further)
+            String custBalKey = "c_" + wid + "_" + did + "_" + cid + "_bal";
+            cc.read(tx, custBalKey, store);
+
+            // Generate order lines (5-15 items per order)
+            int numItems = rand.nextInt(11) + 5;
+            int totalAmount = 0;
+
+            for (int olNum = 1; olNum <= numItems; olNum++) {
+                int iid = rand.nextInt(TPCC_NUM_ITEMS) + 1;
+
+                // Read item price
+                String itemPriceKey = "item_" + iid + "_price";
+                Object priceObj = cc.read(tx, itemPriceKey, store);
+                int price = (priceObj instanceof Integer) ? (Integer) priceObj : 100;
+
+                // Read and decrement stock
+                String stockKey = "s_" + wid + "_" + iid + "_qty";
+                Object stockQtyObj = cc.read(tx, stockKey, store);
+                int stockQty = (stockQtyObj instanceof Integer) ? (Integer) stockQtyObj : TPCC_INITIAL_STOCK;
+
+                int olQty = rand.nextInt(10) + 1;
+
+                int newQty = stockQty - olQty;
+                if (newQty < 10) {
+                    newQty += 91;  // Restock
+                }
+                cc.write(tx, stockKey, newQty, store);
+
+                totalAmount += price * olQty;
+            }
+
+            // Write order record
+            String orderKey = "o_" + wid + "_" + did + "_" + oid + "_total";
+            cc.write(tx, orderKey, totalAmount, store);
+
+            return true;
+        }
+
+        // Issues a payment transaction for TPC-C using the ConcurrencyControl interface.
+        static boolean tpccPayment(ConcurrencyControl cc, Transaction tx, KVStore store) {
+            java.util.Random rand = java.util.concurrent.ThreadLocalRandom.current();
+
+            int wid = rand.nextInt(TPCC_NUM_WAREHOUSES) + 1;
+            int did = rand.nextInt(TPCC_DISTRICTS_PER_WH) + 1;
+            int cid = rand.nextInt(TPCC_CUSTOMERS_PER_DIST) + 1;
+
+            int paymentAmount = rand.nextInt(499901) + 100; // 100-500000
+
+            // Update warehouse YTD
+            String whYtdKey = "w_" + wid + "_ytd";
+            Object whYtdObj = cc.read(tx, whYtdKey, store);
+            int whYtd = (whYtdObj instanceof Integer) ? (Integer) whYtdObj : 0;
+            cc.write(tx, whYtdKey, whYtd + paymentAmount, store);
+
+            // Update district YTD
+            String distYtdKey = "d_" + wid + "_" + did + "_ytd";
+            Object distYtdObj = cc.read(tx, distYtdKey, store);
+            int distYtd = (distYtdObj instanceof Integer) ? (Integer) distYtdObj : 0;
+            cc.write(tx, distYtdKey, distYtd + paymentAmount, store);
+
+            // Update customer balance and YTD payment
+            String custBalKey = "c_" + wid + "_" + did + "_" + cid + "_bal";
+            String custYtdKey = "c_" + wid + "_" + did + "_" + cid + "_ytd";
+
+            Object custBalObj = cc.read(tx, custBalKey, store);
+            Object custYtdObj = cc.read(tx, custYtdKey, store);
+            int custBal = (custBalObj instanceof Integer) ? (Integer) custBalObj : TPCC_INITIAL_BALANCE;
+            int custYtd = (custYtdObj instanceof Integer) ? (Integer) custYtdObj : 0;
+
+            cc.write(tx, custBalKey, custBal - paymentAmount, store);
+            cc.write(tx, custYtdKey, custYtd + paymentAmount, store);
+
+            return true;
+        }
+
+        // A workload thread for TPC-C: begins a transaction, executes new order or payment, then commits or rolls back.
+        static void wlTpcc(ConcurrencyControl cc, KVStore store) {
+            java.util.Random rand = java.util.concurrent.ThreadLocalRandom.current();
+            boolean success;
+
+            Transaction txn = cc.begin(store);
+
+            if (rand.nextBoolean()) {
+                success = tpccNewOrder(cc, txn, store);
+            } else {
+                success = tpccPayment(cc, txn, store);
+            }
+
+            if (success) {
+                cc.commit(txn, store);
+            } else {
+                cc.rollback(txn, store);
+            }
+        }
+      ```
 
   num_top_programs: 3
   use_template_stochasticity: true
 
 # Database configuration
 database:
-  population_size: 40
+  population_size: 1000
   archive_size: 20
   num_islands: 3
   elite_selection_ratio: 0.25
@@ -110,9 +274,9 @@ database:
 
 # Evaluator configuration
 evaluator:
-  timeout: 120
+  timeout: 240
   cascade_evaluation: false
-  parallel_evaluations: 2
+  parallel_evaluations: 1
   use_llm_feedback: false
 
 # Evolution settings

@@ -1,219 +1,295 @@
 package benchmark;
 
-import java.util.*;
+
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.Map;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.*;
 
-// EVOLVE-BLOCK-START
-
-// Helper enum for classifying keys based on TPC-C workload analysis.
-enum KeyType {
-    MANAGED, // Keys that undergo commutative arithmetic operations (e.g., counters, balances).
-    STANDARD // All other keys.
-}
-
-// Helper enum for semantic operations.
-enum OpType {
-    WRITE,     // A standard overwrite operation.
-    INCREMENT  // An arithmetic increment/decrement operation.
-}
-
-// Helper class to represent a semantic operation in the transaction's log.
-class SemanticOp {
-    final OpType type;
-    final String key;
-    Object value; // For WRITE, this is the final value. For INCREMENT, this is the delta (Long).
-
-    SemanticOp(OpType type, String key, Object value) {
-        this.type = type;
-        this.key = key;
-        this.value = value;
-    }
-}
-
+// --- Helper Classes for SHGL ---
 
 /**
- * Implementation of Asynchronous State Reconciliation with Semantic Escrow (ASR-SE).
- *
- * Core Idea: Decouple transaction execution from state reconciliation. Transactions
- * execute against a snapshot, generating a log of high-level semantic operations
- * (e.g., "increment stock by -5"). Committing is a "fast-commit" that places this
- * log on a queue. A single background thread (the Reconciler) applies these
- * changes serially to the database, using atomic operations for contentious keys.
- * This protocol eliminates traditional locking and validation-phase conflicts for
- * the target workload.
+ * Defines the types of locks used in the SHGL protocol.
+ * S: Shared (for reads)
+ * X: Exclusive (for writes)
+ * CU: Commutative Update (for read-modify-writes)
  */
-class GeneratedCC extends ConcurrencyControl {
-    private static final AtomicInteger txidCounter = new AtomicInteger(0);
-    private final BlockingQueue<Transaction> reconciliationQueue = new LinkedBlockingQueue<>();
-    private final Thread reconcilerThread;
-    private volatile boolean running = true;
+enum LockMode {
+    S, X, CU
+}
 
-    public GeneratedCC() {
-        // The KVStore is passed to each method, so we need to get it during reconciliation.
-        // This is a placeholder; the actual store is provided in commit().
-        // We start a daemon thread that will not prevent the JVM from exiting.
-        reconcilerThread = new Thread(new Reconciler());
-        reconcilerThread.setDaemon(true);
-        reconcilerThread.start();
+/**
+ * Represents a lock held by a transaction on a SemanticNode.
+ */
+class Lock {
+    final int txid;
+    final LockMode mode;
+
+    Lock(int txid, LockMode mode) {
+        this.txid = txid;
+        this.mode = mode;
     }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        Lock lock = (Lock) o;
+        return txid == lock.txid && mode == lock.mode;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(txid, mode);
+    }
+}
+
+/**
+ * Represents a node in the Semantic Graph (e.g., a Warehouse, District, Customer).
+ * Each node acts as its own lock manager.
+ */
+class SemanticNode {
+    private final String nodeId;
+    private final ReentrantLock internalLock = new ReentrantLock();
+    private final Condition condition = internalLock.newCondition();
+    private final List<Lock> heldLocks = new ArrayList<>();
+
+    // Lock compatibility matrix. [requesting][held]
+    private static final boolean[][] COMPATIBILITY_MATRIX = {
+        //         S      X      CU
+        /* S */  { true,  false, false },
+        /* X */  { false, false, false },
+        /* CU */ { false, false, false  } // CORRECTED: CU must be exclusive with other CUs to prevent lost updates.
+    };
+
+    public SemanticNode(String nodeId) {
+        this.nodeId = nodeId;
+    }
+
+    public boolean acquire(int txid, LockMode mode, long timeoutMillis) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        internalLock.lock();
+        try {
+            for (Lock lock : heldLocks) {
+                if (lock.txid == txid) {
+                    if (lock.mode.ordinal() >= mode.ordinal()) { // CU > X > S
+                        return true; // Already hold a strong enough lock
+                    }
+                    // Lock upgrade would be complex, so we pessimistically acquire strong locks from the start.
+                }
+            }
+
+            while (!isCompatible(txid, mode)) {
+                if (System.currentTimeMillis() >= deadline) {
+                    return false; // Timeout
+                }
+                if (!condition.await(deadline - System.currentTimeMillis(), TimeUnit.MILLISECONDS)) {
+                    return false; // Timeout
+                }
+            }
+            heldLocks.add(new Lock(txid, mode));
+            return true;
+        } finally {
+            internalLock.unlock();
+        }
+    }
+
+    public void release(int txid) {
+        internalLock.lock();
+        try {
+            heldLocks.removeIf(lock -> lock.txid == txid);
+            condition.signalAll();
+        } finally {
+            internalLock.unlock();
+        }
+    }
+
+    private boolean isCompatible(int txid, LockMode requestMode) {
+        for (Lock heldLock : heldLocks) {
+            if (heldLock.txid == txid) {
+                continue;
+            }
+            if (!COMPATIBILITY_MATRIX[requestMode.ordinal()][heldLock.mode.ordinal()]) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+/**
+ * Manages the semantic graph and maps database keys to graph nodes and lock modes.
+ */
+class GraphManager {
+    private static final GraphManager INSTANCE = new GraphManager();
+    private final ConcurrentHashMap<String, SemanticNode> graph = new ConcurrentHashMap<>();
+
+    private static final Pattern WAREHOUSE_PATTERN = Pattern.compile("^w_(\\d+)_.*");
+    private static final Pattern DISTRICT_PATTERN = Pattern.compile("^d_(\\d+)_(\\d+)_.*");
+    private static final Pattern CUSTOMER_PATTERN = Pattern.compile("^c_(\\d+)_(\\d+)_(\\d+)_.*");
+    private static final Pattern ITEM_PATTERN = Pattern.compile("^item_(\\d+)_.*");
+    private static final Pattern STOCK_PATTERN = Pattern.compile("^s_(\\d+)_(\\d+)_.*");
+    private static final Pattern ORDER_PATTERN = Pattern.compile("^o_(\\d+)_(\\d+)_(\\d+)_.*");
+
+
+    private GraphManager() {}
+
+    public static GraphManager getInstance() {
+        return INSTANCE;
+    }
+
+    private SemanticNode getNode(String nodeId) {
+        return graph.computeIfAbsent(nodeId, SemanticNode::new);
+    }
+
+    static class AnalysisResult {
+        final SemanticNode node;
+        final LockMode mode;
+        AnalysisResult(SemanticNode node, LockMode mode) {
+            this.node = node;
+            this.mode = mode;
+        }
+    }
+
+    public AnalysisResult analyze(String key) {
+        if (key.endsWith("_ytd") || key.endsWith("_bal") || key.endsWith("_qty") || key.endsWith("_next_oid")) {
+            return new AnalysisResult(getNodeForKey(key), LockMode.CU);
+        }
+        if (key.startsWith("item_") && key.endsWith("_price")) {
+            return new AnalysisResult(getNodeForKey(key), LockMode.S);
+        }
+        if (key.startsWith("o_")) {
+             return new AnalysisResult(getNodeForKey(key), LockMode.X);
+        }
+        return new AnalysisResult(getNodeForKey(key), LockMode.X);
+    }
+
+    private SemanticNode getNodeForKey(String key) {
+        Matcher m;
+        m = CUSTOMER_PATTERN.matcher(key); if (m.matches()) return getNode("C-" + m.group(1) + "-" + m.group(2) + "-" + m.group(3));
+        m = DISTRICT_PATTERN.matcher(key); if (m.matches()) return getNode("D-" + m.group(1) + "-" + m.group(2));
+        m = STOCK_PATTERN.matcher(key); if (m.matches()) return getNode("S-" + m.group(1) + "-" + m.group(2));
+        m = WAREHOUSE_PATTERN.matcher(key); if (m.matches()) return getNode("W-" + m.group(1));
+        m = ORDER_PATTERN.matcher(key); if (m.matches()) return getNode("O-" + m.group(1) + "-" + m.group(2) + "-" + m.group(3));
+        m = ITEM_PATTERN.matcher(key); if (m.matches()) return getNode("I-" + m.group(1));
+        return getNode(key);
+    }
+}
+
+
+class GeneratedCC extends ConcurrencyControl {
+    private final AtomicInteger txidCounter = new AtomicInteger(0);
+    private final GraphManager graphManager = GraphManager.getInstance();
+    // CORRECTED: Reduced timeout to break deadlocks faster and avoid stalled threads.
+    private static final long LOCK_TIMEOUT_MS = 100;
+    
+    private static final Object NULL_PLACEHOLDER = new Object();
 
     public static ConcurrencyControl buildCc() {
         return new GeneratedCC();
     }
 
-    /**
-     * The background worker that serially applies committed transaction logs.
-     * This single-threaded application of changes is what guarantees serializability.
-     */
-    private class Reconciler implements Runnable {
-        @Override
-        public void run() {
-            while (running) {
-                try {
-                    // Block until a committed transaction is available.
-                    Transaction txn = reconciliationQueue.take();
-                    // The KVStore is not stored in GeneratedCC, so we get it from the transaction's metadata.
-                    KVStore store = (KVStore) txn.meta.get("store");
-                    if (store != null) {
-                        applyChanges(txn, store);
-                    }
-                } catch (InterruptedException e) {
-                    // Gracefully exit if the thread is interrupted.
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        }
-    }
-
-    /**
-     * Applies the semantic log of a transaction to the KVStore.
-     */
-    private void applyChanges(Transaction txn, KVStore store) {
-        for (Object opObject : txn.writeSet.values()) {
-            SemanticOp op = (SemanticOp) opObject;
-            switch (op.type) {
-                case WRITE:
-                    store.update(op.key, op.value);
-                    break;
-                case INCREMENT:
-                    store.increment(op.key, (Long) op.value);
-                    break;
-            }
-        }
-        txn.status = TxStatus.COMMITTED;
-    }
-    
-    /**
-     * Simulates the offline static analysis of transaction templates.
-     * In a real system, this would be done by a compiler. Here, we use string patterns.
-     */
-    private KeyType classifyKey(String key) {
-        if (key.endsWith("_ytd") || key.endsWith("_bal") || key.endsWith("_qty") || key.endsWith("_next_oid")) {
-            return KeyType.MANAGED;
-        }
-        return KeyType.STANDARD;
-    }
-
     @Override
     public Transaction begin(KVStore store) {
         int txid = txidCounter.incrementAndGet();
-        Transaction txn = new Transaction(txid, txid);
-        // We need the store reference during reconciliation.
-        txn.meta.put("store", store);
+        Transaction txn = new Transaction(txid, 0);
+        txn.meta.put("locked_nodes", new HashSet<SemanticNode>());
         return txn;
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public Object read(Transaction txn, String key, KVStore store) {
-        if (txn.status == TxStatus.ABORTED) {
+        if (txn.status != TxStatus.ACTIVE) return null;
+
+        if (txn.writeSet.containsKey(key)) {
+            Object value = txn.writeSet.get(key);
+            return value == NULL_PLACEHOLDER ? null : value;
+        }
+
+        GraphManager.AnalysisResult analysis = graphManager.analyze(key);
+        try {
+            if (!analysis.node.acquire(txn.txid, analysis.mode, LOCK_TIMEOUT_MS)) {
+                txn.status = TxStatus.ABORTED;
+                return null;
+            }
+            ((Set<SemanticNode>) txn.meta.get("locked_nodes")).add(analysis.node);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            txn.status = TxStatus.ABORTED;
             return null;
         }
 
-        // Enforce repeatable reads by checking our private readSet first.
-        if (txn.readSet.containsKey(key)) {
-            return txn.readSet.get(key);
-        }
-
-        // Read from the actual store if it's the first time.
         Object value = store.get(key);
-        
-        // Unbox AtomicLong to Long for consistent handling within the transaction.
-        Object storedValue = (value instanceof AtomicLong) ? ((AtomicLong) value).get() : value;
-
-        // Cache the value in our snapshot (readSet).
-        if (storedValue != null) {
-            txn.readSet.put(key, storedValue);
-        }
-        
-        return storedValue;
+        txn.readSet.put(key, value == null ? NULL_PLACEHOLDER : value);
+        return value;
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public void write(Transaction txn, String key, Object value, KVStore store) {
-        if (txn.status == TxStatus.ABORTED) {
+        if (txn.status != TxStatus.ACTIVE) return;
+
+        GraphManager.AnalysisResult analysis = graphManager.analyze(key);
+        try {
+            if (!analysis.node.acquire(txn.txid, analysis.mode, LOCK_TIMEOUT_MS)) {
+                txn.status = TxStatus.ABORTED;
+                return;
+            }
+            ((Set<SemanticNode>) txn.meta.get("locked_nodes")).add(analysis.node);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            txn.status = TxStatus.ABORTED;
             return;
         }
 
-        KeyType type = classifyKey(key);
-
-        if (type == KeyType.MANAGED) {
-            // For managed keys, we calculate the delta and create an INCREMENT operation.
-            // The transaction logic is assumed to be read-modify-write, so the original
-            // value must have been read into the readSet.
-            Object originalValueObj = txn.readSet.get(key);
-            long originalValue = (originalValueObj instanceof Number) ? ((Number) originalValueObj).longValue() : 0;
-            long newValue = (value instanceof Number) ? ((Number) value).longValue() : 0;
-            long delta = newValue - originalValue;
-
-            // Aggregate deltas if the key is written multiple times.
-            SemanticOp existingOp = (SemanticOp) txn.writeSet.get(key);
-            if (existingOp != null && existingOp.type == OpType.INCREMENT) {
-                existingOp.value = (Long) existingOp.value + delta;
-            } else {
-                txn.writeSet.put(key, new SemanticOp(OpType.INCREMENT, key, delta));
-            }
-        } else { // STANDARD key
-            // For standard keys, it's a simple WRITE operation.
-            txn.writeSet.put(key, new SemanticOp(OpType.WRITE, key, value));
-        }
+        txn.writeSet.put(key, value == null ? NULL_PLACEHOLDER : value);
     }
 
     @Override
     public CommitResult commit(Transaction txn, KVStore store) {
         if (txn.status == TxStatus.ABORTED) {
-            return CommitResult.failure("Transaction was already aborted.");
+            rollback(txn, store);
+            return CommitResult.failure("Transaction was aborted due to conflict or timeout.");
         }
-        
-        // "Fast-commit": Enqueue the transaction for background reconciliation.
-        // The client can return immediately.
-        try {
-            reconciliationQueue.put(txn);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return CommitResult.failure("Commit was interrupted.");
+        if (txn.status == TxStatus.COMMITTED) {
+            return CommitResult.failure("Transaction already committed.");
         }
 
-        // The commit timestamp is logically the transaction's start time,
-        // as this defines the snapshot it operated on.
-        return CommitResult.success(txn.startTs);
+        if (!txn.writeSet.isEmpty()) {
+            Map<String, Object> writesToApply = new HashMap<>();
+            for (Map.Entry<String, Object> entry : txn.writeSet.entrySet()) {
+                Object value = entry.getValue();
+                writesToApply.put(entry.getKey(), value == NULL_PLACEHOLDER ? null : value);
+            }
+            store.updateAll(writesToApply);
+        }
+
+        releaseAllLocks(txn);
+        txn.status = TxStatus.COMMITTED;
+        return CommitResult.success(0);
     }
 
     @Override
     public void rollback(Transaction txn, KVStore store) {
-        // No need to undo changes in KVStore, as none have been applied yet.
-        txn.status = TxStatus.ABORTED;
-        txn.readSet.clear();
-        txn.writeSet.clear();
+        if (txn.status != TxStatus.COMMITTED) {
+            releaseAllLocks(txn);
+            txn.status = TxStatus.ABORTED;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void releaseAllLocks(Transaction txn) {
+        Set<SemanticNode> lockedNodes = (Set<SemanticNode>) txn.meta.get("locked_nodes");
+        if (lockedNodes != null) {
+            for (SemanticNode node : lockedNodes) {
+                node.release(txn.txid);
+            }
+            lockedNodes.clear();
+        }
     }
 }
-
-// EVOLVE-BLOCK-END
