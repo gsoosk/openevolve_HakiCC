@@ -1,193 +1,58 @@
 package benchmark;
 
+/* Technical Report:
+### **Technical Report: Optimistic Concurrency Control with Atomic Snapshot Validation**
 
+*   **Algorithm Overview:** The protocol is a strict, optimistic concurrency control (OCC) algorithm that uses versioning to ensure serializability. Transactions execute in three phases: an optimistic execution phase where reads and writes are buffered locally, a validation phase, and a write phase. The protocol's key feature is an atomic intra-read validation mechanism that guarantees a transaction always operates on a consistent snapshot of the database, preventing anomalies like write skew.
+
+*   **Read/Write Strategy:**
+    *   **Read Operation:** When a transaction reads a key for the first time, it performs an atomic validation of its existing read-set. This is achieved by acquiring a global lock, re-checking the versions of all previously read keys, and aborting if any have changed. If the snapshot is valid, the lock is released, and the transaction reads the new key's value and its current version from the store. Subsequent reads of the same key return the locally cached value.
+    *   **Write Operation:** Writes are buffered in the transaction's private write-set. To handle "blind writes" (writing to a key not previously read), the write operation first invokes the read operation on the key. This ensures every key in the write-set has a corresponding version dependency established for validation.
+
+*   **Validation Strategy:** Validation occurs at two points: proactively during reads (as described above) and finally at commit time. The commit phase is executed atomically under a single global lock. The transaction re-validates the versions of all keys in its read-set against the global versions. If all versions match, the transaction is successful. If any version mismatch is found, the transaction is immediately aborted.
+
+*   **Deadlock Handling:** The protocol is **deadlock-free**. It does not use per-data-item locks during transaction execution. The use of a single global lock for short, well-defined critical sections (snapshot validation and commit) prevents any possibility of circular wait conditions.
+
+*   **Correctness Guarantees:** The protocol ensures **Strict Conflict-Serializability**.
+    *   **Conflict-Serializability:** The combination of atomic snapshot validation during reads and a final atomic validation at commit time guarantees that any transaction operates on a consistent view of the database. This prevents read-write and write-write conflicts from producing non-serializable histories.
+    *   **Strictness:** All writes are buffered and applied to the database atomically only after the transaction has successfully passed validation. This ensures that uncommitted data is never visible, preventing dirty reads and cascading aborts.
+
+*   **Complexity and Performance Notes:**
+    *   The primary performance trade-off is the use of a global lock to validate the snapshot during read operations. This serializes a portion of the read path, adding latency that scales with the size of a transaction's read-set.
+    *   The benefit of this approach is a significant reduction in wasted work, as transactions operating on an invalidated snapshot are aborted early rather than continuing to execute only to fail at commit time.
+    *   The single commit lock can be a bottleneck under very high commit rates, limiting scalability on systems with a large number of cores. The protocol is best suited for workloads with moderate to high contention where transaction durations are relatively short.
+
+*   **Assumptions and Limitations:**
+    *   The protocol assumes a single-node database architecture.
+    *   A key limitation is the global lock, which impacts the scalability of read operations. This makes the protocol less suitable for long-running, read-intensive analytical transactions.
+    *   The protocol is optimized for correctness and robustness, trading some potential throughput for guaranteed serializability in complex transactional scenarios.
+*/
+
+
+// EVOLVE-BLOCK-START
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.*;
-
-// --- Helper Classes for SHGL ---
 
 /**
- * Defines the types of locks used in the SHGL protocol.
- * S: Shared (for reads)
- * X: Exclusive (for writes)
- * CU: Commutative Update (for read-modify-writes)
+ * Implementation of a correct, strict Optimistic Concurrency Control (OCC) protocol.
+ *
+ * This version fixes serializability violations by ensuring snapshot consistency.
+ * It uses an atomic intra-read validation mechanism. Before a transaction reads a
+ * new key, it acquires a global lock to atomically verify that all previously
+ * read keys are still valid. This prevents the transaction from operating on an
+ * inconsistent snapshot of the database, thus avoiding anomalies like write skew.
  */
-enum LockMode {
-    S, X, CU
-}
-
-/**
- * Represents a lock held by a transaction on a SemanticNode.
- */
-class Lock {
-    final int txid;
-    final LockMode mode;
-
-    Lock(int txid, LockMode mode) {
-        this.txid = txid;
-        this.mode = mode;
-    }
-
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
-        Lock lock = (Lock) o;
-        return txid == lock.txid && mode == lock.mode;
-    }
-
-    @Override
-    public int hashCode() {
-        return Objects.hash(txid, mode);
-    }
-}
-
-/**
- * Represents a node in the Semantic Graph (e.g., a Warehouse, District, Customer).
- * Each node acts as its own lock manager.
- */
-class SemanticNode {
-    private final String nodeId;
-    private final ReentrantLock internalLock = new ReentrantLock();
-    private final Condition condition = internalLock.newCondition();
-    private final List<Lock> heldLocks = new ArrayList<>();
-
-    // Lock compatibility matrix. [requesting][held]
-    private static final boolean[][] COMPATIBILITY_MATRIX = {
-        //         S      X      CU
-        /* S */  { true,  false, false },
-        /* X */  { false, false, false },
-        /* CU */ { false, false, false  } // CORRECTED: CU must be exclusive with other CUs to prevent lost updates.
-    };
-
-    public SemanticNode(String nodeId) {
-        this.nodeId = nodeId;
-    }
-
-    public boolean acquire(int txid, LockMode mode, long timeoutMillis) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + timeoutMillis;
-        internalLock.lock();
-        try {
-            for (Lock lock : heldLocks) {
-                if (lock.txid == txid) {
-                    if (lock.mode.ordinal() >= mode.ordinal()) { // CU > X > S
-                        return true; // Already hold a strong enough lock
-                    }
-                    // Lock upgrade would be complex, so we pessimistically acquire strong locks from the start.
-                }
-            }
-
-            while (!isCompatible(txid, mode)) {
-                if (System.currentTimeMillis() >= deadline) {
-                    return false; // Timeout
-                }
-                if (!condition.await(deadline - System.currentTimeMillis(), TimeUnit.MILLISECONDS)) {
-                    return false; // Timeout
-                }
-            }
-            heldLocks.add(new Lock(txid, mode));
-            return true;
-        } finally {
-            internalLock.unlock();
-        }
-    }
-
-    public void release(int txid) {
-        internalLock.lock();
-        try {
-            heldLocks.removeIf(lock -> lock.txid == txid);
-            condition.signalAll();
-        } finally {
-            internalLock.unlock();
-        }
-    }
-
-    private boolean isCompatible(int txid, LockMode requestMode) {
-        for (Lock heldLock : heldLocks) {
-            if (heldLock.txid == txid) {
-                continue;
-            }
-            if (!COMPATIBILITY_MATRIX[requestMode.ordinal()][heldLock.mode.ordinal()]) {
-                return false;
-            }
-        }
-        return true;
-    }
-}
-
-/**
- * Manages the semantic graph and maps database keys to graph nodes and lock modes.
- */
-class GraphManager {
-    private static final GraphManager INSTANCE = new GraphManager();
-    private final ConcurrentHashMap<String, SemanticNode> graph = new ConcurrentHashMap<>();
-
-    private static final Pattern WAREHOUSE_PATTERN = Pattern.compile("^w_(\\d+)_.*");
-    private static final Pattern DISTRICT_PATTERN = Pattern.compile("^d_(\\d+)_(\\d+)_.*");
-    private static final Pattern CUSTOMER_PATTERN = Pattern.compile("^c_(\\d+)_(\\d+)_(\\d+)_.*");
-    private static final Pattern ITEM_PATTERN = Pattern.compile("^item_(\\d+)_.*");
-    private static final Pattern STOCK_PATTERN = Pattern.compile("^s_(\\d+)_(\\d+)_.*");
-    private static final Pattern ORDER_PATTERN = Pattern.compile("^o_(\\d+)_(\\d+)_(\\d+)_.*");
-
-
-    private GraphManager() {}
-
-    public static GraphManager getInstance() {
-        return INSTANCE;
-    }
-
-    private SemanticNode getNode(String nodeId) {
-        return graph.computeIfAbsent(nodeId, SemanticNode::new);
-    }
-
-    static class AnalysisResult {
-        final SemanticNode node;
-        final LockMode mode;
-        AnalysisResult(SemanticNode node, LockMode mode) {
-            this.node = node;
-            this.mode = mode;
-        }
-    }
-
-    public AnalysisResult analyze(String key) {
-        if (key.endsWith("_ytd") || key.endsWith("_bal") || key.endsWith("_qty") || key.endsWith("_next_oid")) {
-            return new AnalysisResult(getNodeForKey(key), LockMode.CU);
-        }
-        if (key.startsWith("item_") && key.endsWith("_price")) {
-            return new AnalysisResult(getNodeForKey(key), LockMode.S);
-        }
-        if (key.startsWith("o_")) {
-             return new AnalysisResult(getNodeForKey(key), LockMode.X);
-        }
-        return new AnalysisResult(getNodeForKey(key), LockMode.X);
-    }
-
-    private SemanticNode getNodeForKey(String key) {
-        Matcher m;
-        m = CUSTOMER_PATTERN.matcher(key); if (m.matches()) return getNode("C-" + m.group(1) + "-" + m.group(2) + "-" + m.group(3));
-        m = DISTRICT_PATTERN.matcher(key); if (m.matches()) return getNode("D-" + m.group(1) + "-" + m.group(2));
-        m = STOCK_PATTERN.matcher(key); if (m.matches()) return getNode("S-" + m.group(1) + "-" + m.group(2));
-        m = WAREHOUSE_PATTERN.matcher(key); if (m.matches()) return getNode("W-" + m.group(1));
-        m = ORDER_PATTERN.matcher(key); if (m.matches()) return getNode("O-" + m.group(1) + "-" + m.group(2) + "-" + m.group(3));
-        m = ITEM_PATTERN.matcher(key); if (m.matches()) return getNode("I-" + m.group(1));
-        return getNode(key);
-    }
-}
-
-
 class GeneratedCC extends ConcurrencyControl {
-    private final AtomicInteger txidCounter = new AtomicInteger(0);
-    private final GraphManager graphManager = GraphManager.getInstance();
-    // CORRECTED: Reduced timeout to break deadlocks faster and avoid stalled threads.
-    private static final long LOCK_TIMEOUT_MS = 100;
-    
-    private static final Object NULL_PLACEHOLDER = new Object();
+
+    private final AtomicInteger transactionCounter = new AtomicInteger(0);
+    private final ConcurrentHashMap<String, AtomicInteger> versionMap = new ConcurrentHashMap<>();
+    private final ReentrantLock commitLock = new ReentrantLock();
+
+    private static final String READ_VERSIONS_KEY = "readVersions";
+    private static final Object NULL_SENTINEL = new Object();
 
     public static ConcurrencyControl buildCc() {
         return new GeneratedCC();
@@ -195,9 +60,9 @@ class GeneratedCC extends ConcurrencyControl {
 
     @Override
     public Transaction begin(KVStore store) {
-        int txid = txidCounter.incrementAndGet();
-        Transaction txn = new Transaction(txid, 0);
-        txn.meta.put("locked_nodes", new HashSet<SemanticNode>());
+        int txid = transactionCounter.incrementAndGet();
+        Transaction txn = new Transaction(txid, txid);
+        txn.meta.put(READ_VERSIONS_KEY, new ConcurrentHashMap<String, Integer>());
         return txn;
     }
 
@@ -205,91 +70,122 @@ class GeneratedCC extends ConcurrencyControl {
     @SuppressWarnings("unchecked")
     public Object read(Transaction txn, String key, KVStore store) {
         if (txn.status != TxStatus.ACTIVE) return null;
-
-        if (txn.writeSet.containsKey(key)) {
-            Object value = txn.writeSet.get(key);
-            return value == NULL_PLACEHOLDER ? null : value;
+        if (txn.writeSet.containsKey(key)) return txn.writeSet.get(key);
+        
+        if (txn.readSet.containsKey(key)) {
+            Object value = txn.readSet.get(key);
+            return value == NULL_SENTINEL ? null : value;
         }
 
-        GraphManager.AnalysisResult analysis = graphManager.analyze(key);
+        Map<String, Integer> readVersions = (Map<String, Integer>) txn.meta.get(READ_VERSIONS_KEY);
+
+        // --- ATOMIC INTRA-TRANSACTION SNAPSHOT VALIDATION ---
+        // Before reading a new key, atomically ensure the existing snapshot is still valid.
+        // This prevents the transaction from building an inconsistent view of the data.
+        commitLock.lock();
         try {
-            if (!analysis.node.acquire(txn.txid, analysis.mode, LOCK_TIMEOUT_MS)) {
-                txn.status = TxStatus.ABORTED;
-                return null;
+            for (Map.Entry<String, Integer> entry : readVersions.entrySet()) {
+                String validatedKey = entry.getKey();
+                int recordedVersion = entry.getValue();
+                
+                int currentVersion = versionMap.computeIfAbsent(validatedKey, k -> new AtomicInteger(0)).get();
+                if (recordedVersion != currentVersion) {
+                    // Snapshot is broken by a concurrent commit. Abort immediately.
+                    rollback(txn, store);
+                    return null;
+                }
             }
-            ((Set<SemanticNode>) txn.meta.get("locked_nodes")).add(analysis.node);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            txn.status = TxStatus.ABORTED;
-            return null;
+        } finally {
+            commitLock.unlock();
         }
 
-        Object value = store.get(key);
-        txn.readSet.put(key, value == null ? NULL_PLACEHOLDER : value);
-        return value;
+        // If validation caused an abort, the status will have changed.
+        if (txn.status != TxStatus.ACTIVE) return null;
+
+        // --- READ NEW KEY (if validation passed) ---
+        Object valueFromStore;
+        int versionRead;
+        while (true) {
+            versionRead = versionMap.computeIfAbsent(key, k -> new AtomicInteger(0)).get();
+            valueFromStore = store.get(key);
+            int versionAfterRead = versionMap.get(key).get();
+            if (versionRead == versionAfterRead) break;
+        }
+
+        Object returnValue = (valueFromStore instanceof AtomicLong) ? ((AtomicLong) valueFromStore).get() : valueFromStore;
+        
+        readVersions.put(key, versionRead);
+        txn.readSet.put(key, returnValue == null ? NULL_SENTINEL : returnValue);
+
+        return returnValue;
+    }
+
+    @Override
+    public void write(Transaction txn, String key, Object value, KVStore store) {
+        if (txn.status != TxStatus.ACTIVE) return;
+
+        // Eagerly establish a version dependency for blind writes.
+        if (!txn.readSet.containsKey(key) && !txn.writeSet.containsKey(key)) {
+            read(txn, key, store);
+        }
+
+        // The read() call might have aborted the transaction. Check status before proceeding.
+        if (txn.status != TxStatus.ACTIVE) return;
+
+        txn.writeSet.put(key, value);
     }
 
     @Override
     @SuppressWarnings("unchecked")
-    public void write(Transaction txn, String key, Object value, KVStore store) {
-        if (txn.status != TxStatus.ACTIVE) return;
-
-        GraphManager.AnalysisResult analysis = graphManager.analyze(key);
-        try {
-            if (!analysis.node.acquire(txn.txid, analysis.mode, LOCK_TIMEOUT_MS)) {
-                txn.status = TxStatus.ABORTED;
-                return;
-            }
-            ((Set<SemanticNode>) txn.meta.get("locked_nodes")).add(analysis.node);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            txn.status = TxStatus.ABORTED;
-            return;
-        }
-
-        txn.writeSet.put(key, value == null ? NULL_PLACEHOLDER : value);
-    }
-
-    @Override
     public CommitResult commit(Transaction txn, KVStore store) {
-        if (txn.status == TxStatus.ABORTED) {
-            rollback(txn, store);
-            return CommitResult.failure("Transaction was aborted due to conflict or timeout.");
-        }
-        if (txn.status == TxStatus.COMMITTED) {
-            return CommitResult.failure("Transaction already committed.");
+        if (txn.status != TxStatus.ACTIVE) {
+            return CommitResult.failure("Transaction already " + txn.status);
         }
 
-        if (!txn.writeSet.isEmpty()) {
-            Map<String, Object> writesToApply = new HashMap<>();
-            for (Map.Entry<String, Object> entry : txn.writeSet.entrySet()) {
-                Object value = entry.getValue();
-                writesToApply.put(entry.getKey(), value == NULL_PLACEHOLDER ? null : value);
+        Map<String, Integer> readVersions = (Map<String, Integer>) txn.meta.get(READ_VERSIONS_KEY);
+        
+        commitLock.lock();
+        try {
+            // Final validation at commit time is still required.
+            for (Map.Entry<String, Integer> entry : readVersions.entrySet()) {
+                String key = entry.getKey();
+                int readVersion = entry.getValue();
+                
+                int currentVersion = versionMap.computeIfAbsent(key, k -> new AtomicInteger(0)).get();
+
+                if (readVersion != currentVersion) {
+                    rollback(txn, store);
+                    return CommitResult.failure("Validation failed on key: " + key);
+                }
             }
-            store.updateAll(writesToApply);
-        }
 
-        releaseAllLocks(txn);
-        txn.status = TxStatus.COMMITTED;
-        return CommitResult.success(0);
+            // --- Write Phase ---
+            int commitTs = transactionCounter.incrementAndGet();
+            
+            for (Map.Entry<String, Object> entry : txn.writeSet.entrySet()) {
+                String key = entry.getKey();
+                Object value = entry.getValue();
+
+                store.update(key, value);
+                versionMap.get(key).incrementAndGet();
+            }
+
+            txn.status = TxStatus.COMMITTED;
+            return CommitResult.success(commitTs);
+
+        } finally {
+            commitLock.unlock();
+        }
     }
 
     @Override
     public void rollback(Transaction txn, KVStore store) {
-        if (txn.status != TxStatus.COMMITTED) {
-            releaseAllLocks(txn);
+        if (txn.status == TxStatus.ACTIVE) {
             txn.status = TxStatus.ABORTED;
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private void releaseAllLocks(Transaction txn) {
-        Set<SemanticNode> lockedNodes = (Set<SemanticNode>) txn.meta.get("locked_nodes");
-        if (lockedNodes != null) {
-            for (SemanticNode node : lockedNodes) {
-                node.release(txn.txid);
-            }
-            lockedNodes.clear();
+            txn.readSet.clear();
+            txn.writeSet.clear();
+            txn.meta.clear();
         }
     }
 }
+// EVOLVE-BLOCK-END

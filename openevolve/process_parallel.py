@@ -33,6 +33,7 @@ class SerializableResult:
     artifacts: Optional[Dict[str, Any]] = None
     iteration: int = 0
     error: Optional[str] = None
+    target_island: Optional[int] = None  # Target island for proper distribution with parallel_evaluations=1
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -148,10 +149,22 @@ def _run_iteration_worker(
         parent_artifacts = db_snapshot["artifacts"].get(parent_id)
 
         # Get island-specific programs for context
-        parent_island = parent.metadata.get("island", db_snapshot["current_island"])
-        island_programs = [
-            programs[pid] for pid in db_snapshot["islands"][parent_island] if pid in programs
-        ]
+        # Use the target sampling_island for child assignment (not parent's island)
+        # This ensures islands get populated even when sampling falls back due to empty islands
+        target_island = db_snapshot.get("sampling_island", db_snapshot["current_island"])
+        
+        # Get programs from target island for context, fall back to parent's island if target is empty
+        target_island_programs = db_snapshot["islands"][target_island]
+        if target_island_programs:
+            island_programs = [
+                programs[pid] for pid in target_island_programs if pid in programs
+            ]
+        else:
+            # Target island empty, use parent's island for context
+            parent_island = parent.metadata.get("island", target_island)
+            island_programs = [
+                programs[pid] for pid in db_snapshot["islands"][parent_island] if pid in programs
+            ]
 
         # Sort by metrics for top programs
         island_programs.sort(
@@ -241,6 +254,7 @@ def _run_iteration_worker(
         artifacts = _worker_evaluator.get_pending_artifacts(child_id)
 
         # Create child program
+        # Use target_island to ensure proper island distribution even with parallel_evaluations=1
         child_program = Program(
             id=child_id,
             code=child_code,
@@ -252,7 +266,7 @@ def _run_iteration_worker(
             metadata={
                 "changes": changes_summary,
                 "parent_metrics": parent.metrics,
-                "island": parent_island,
+                "island": target_island,
             },
         )
 
@@ -266,6 +280,7 @@ def _run_iteration_worker(
             llm_response=llm_response,
             artifacts=artifacts,
             iteration=iteration,
+            target_island=target_island,
         )
 
     except Exception as e:
@@ -495,9 +510,13 @@ class ProcessParallelController:
                     # Reconstruct program from dict
                     child_program = Program(**result.child_program_dict)
 
-                    # Add to database (will auto-inherit parent's island)
-                    # No need to specify target_island - database will handle parent island inheritance
-                    self.database.add(child_program, iteration=completed_iteration)
+                    # Add to database with explicit target_island for proper distribution
+                    # This ensures islands get populated even with parallel_evaluations=1
+                    self.database.add(
+                        child_program,
+                        iteration=completed_iteration,
+                        target_island=result.target_island,
+                    )
 
                     # Store artifacts
                     if result.artifacts:

@@ -38,7 +38,8 @@ ENV/
 
 # Output files
 examples/*/output/
-openevolve_output*/
+openevolve_output*/checkpoints/*
+openevolve_output*/logs/*
 *.log
 
 # Test cache
