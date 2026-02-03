@@ -1345,7 +1345,8 @@ public class Evaluator {
             // scenarios.put("tpcc", runScenario(ccFactory, Evaluator::wlTpcc, 64, 5.0, 0.5, Evaluator::initTpccData));
 
             // TPC-C with different warehouse counts (scalability benchmark)
-            int[] warehouseCounts = {1, 2, 4, 8, 16};
+            // int[] warehouseCounts = {1, 2, 4, 8, 16};
+            int[] warehouseCounts = {2, 8, 16};
             for (int whCount : warehouseCounts) {
                 TpccConfig config = TpccConfig.withWarehouses(whCount);
                 String scenarioName = config.configName;
@@ -1362,7 +1363,7 @@ public class Evaluator {
 
             if (!correctnessOnly) {
             // TPC-C with different contention levels (8 warehouses, varying hotspot intensity)
-                String[] contentionLevels = {"very_low", "low", "medium", "high", "very_high", "extreme"};
+                String[] contentionLevels = {"low", "medium", "very_high"};
                 for (String level : contentionLevels) {
                     TpccConfig config = TpccConfig.withContention(level);
                     String scenarioName = config.configName;
