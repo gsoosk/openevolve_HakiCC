@@ -1,7 +1,8 @@
-max_iterations: 20
+max_iterations: 1000
 checkpoint_interval: 2
 log_level: "INFO"
 suffix: ".java"
+random_seed: 42
 
 # LLM configuration
 llm:
@@ -21,7 +22,7 @@ prompt:
   system_message: |
     You are an expert researcher in **transactional concurrency control**.
 
-    Your task is to optimize and iteratively improve a **concurrency control (CC) algorithm** specifically for a pre-known transactions workload. 
+    Your task is to optimize and iteratively improve a **concurrency control (CC) algorithm** specifically designed for a pre-known transactions workload. 
      
     The evaluator will run many concurrent workloads against your CC
     implementation, log the actual get/put/increment/decrement/delete operations that hit the storage
@@ -81,24 +82,21 @@ prompt:
         
 
     Optimize your CC algorithm so that:
-      - It never exposes non-serializable histories (no precedence cycles over
-        committed transactions).
+      - It is conflict-serializable (no precedence cycles over committed transactions).
       - It handles the deadlock-prone workload without leaving threads stalled.
-      - It achieves as high a throughput as possible on multi-core machines.
-      - It achieves as high a throughput as possible on the pre-known transactions workload.
+      - IMPORTANT: It achieves as high a throughput as possible on multi-core machines.
+      - IMPORTANT: It achieves as high a throughput as possible on the pre-known transactions workload.
       - Your CC algorithm MUST call KVStore methods to interact with the storage engine and persist the changes. DO NOT BYPASS THE KVStore methods to improve scores. 
 
     You may:
       - Maintain per-transaction metadata in `txn.meta`.
-      - Keep global data structures inside your CC class (e.g. lock tables,
-        wait-for graphs, timestamp allocators).
-      - Implement optimistic (OCC), pessimistic (2PL), or hybrid schemes, as
-        long as they use only the provided interfaces to interact with storage.
+      - Keep global data structures inside the CC class (e.g. lock tables, wait-for graphs, timestamp allocators).
 
     Do NOT:
       - Modify `KVStore` or rely on its internals.
-      - Change the signatures of `begin`, `read`, `write`, `commit`, `rollback`,
-        or `build_cc`.
+      - Change the signatures of `begin`, `read`, `write`, `commit`, `rollback`, or `build_cc`.
+      - DO NOT BYPASS THE KVStore methods to improve scores. 
+      - VERY IMPORTANT: DO NOT Change the core idea of the CC algorithm. You are only improving the implementation, not the idea.
 
     Pre-known transactions workload:
       ```java
@@ -276,8 +274,8 @@ database:
   exploration_ratio: 0.3
   exploitation_ratio: 0.7
 
-  embedding_model: "text-embedding-3-small"
-  similarity_threshold: 0.99
+  # embedding_model: "text-embedding-3-small"
+  # similarity_threshold: 0.99
 
 # Evaluator configuration
 evaluator:

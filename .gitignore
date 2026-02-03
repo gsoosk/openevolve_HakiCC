@@ -58,5 +58,7 @@ problems
 # CC
 CC/benchmark/output.json
 CC/benchmark/benchmark/*
+CC/benchmark/tmp*.json
 
 nohup.out
+
