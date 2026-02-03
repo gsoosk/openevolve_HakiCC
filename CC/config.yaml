@@ -76,9 +76,10 @@ prompt:
       - Compute metrics:
           * `correctness`: fraction of scenarios that are serializable (no cycles)
             and, for the deadlock workload, also stall-free
-          * `throughput_score`: average committed transactions per second
-          * `pre_known_transactions_throughput`: average committed transactions per second for the pre-known transactions workload. This is the most important workload to achieve high throughput on.
-          * `combined_score`: weighted combination of correctness and throughput and pre-known transactions throughput. 
+          * `throughput_score`: normalized average throughput score across all scenarios
+          * `pre_known_transactions_under_high_contention`: throughput score for TPC-C under very high contention (hot items/warehouses). This tests your algorithm's ability to handle extreme contention.
+          * `pre_known_transactions_normal_scenario`: throughput score for TPC-C with 8 warehouses (normal scenario). This is the most important workload to achieve high throughput on.
+          * `combined_score`: weighted combination of correctness and throughput scores. 
         
 
     Optimize your CC algorithm so that:
@@ -279,7 +280,7 @@ database:
 
 # Evaluator configuration
 evaluator:
-  timeout: 240
+  timeout: 360
   cascade_evaluation: false
   parallel_evaluations: 1
   use_llm_feedback: false

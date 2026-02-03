@@ -53,7 +53,8 @@ def evaluate(program_path: str) -> EvaluationResult:
           - correctness: fraction of scenarios that are serializable and stall-free
           - throughput_score: normalized throughput score
           - combined_score: weighted combination of correctness and throughput
-          - pre_known_transactions_throughput: raw throughput number
+          - pre_known_transactions_under_high_contention: throughput score under high contention
+          - pre_known_transactions_normal_scenario: throughput score for normal scenario (8 warehouses)
     """
     try:
         # Convert to absolute path for use with the script
@@ -119,12 +120,16 @@ def evaluate(program_path: str) -> EvaluationResult:
             artifacts = java_result.get("artifacts", {})
 
             # Ensure required metrics exist with defaults
+            # Match the Java Evaluator's output metric names
             final_metrics = {
                 "correctness": float(metrics.get("correctness", 0.0)),
                 "throughput_score": float(metrics.get("throughput_score", 0.0)),
                 "combined_score": float(metrics.get("combined_score", 0.0)),
-                "pre_known_transactions_throughput": float(
-                    metrics.get("pre_known_transactions_throughput", 0.0)
+                "pre_known_transactions_under_high_contention": float(
+                    metrics.get("pre_known_transactions_under_high_contention", 0.0)
+                ),
+                "pre_known_transactions_normal_scenario": float(
+                    metrics.get("pre_known_transactions_normal_scenario", 0.0)
                 ),
             }
 
@@ -132,6 +137,8 @@ def evaluate(program_path: str) -> EvaluationResult:
             final_artifacts: Dict[str, Any] = {}
             if "scenario_summaries" in artifacts:
                 final_artifacts["scenario_summaries"] = artifacts["scenario_summaries"]
+            if "tpcc_avg_throughputs" in artifacts:
+                final_artifacts["tpcc_avg_throughputs"] = artifacts["tpcc_avg_throughputs"]
 
             # Include any error information from Java evaluator
             if "error" in java_result:
@@ -157,7 +164,8 @@ def evaluate(program_path: str) -> EvaluationResult:
                 "correctness": 0.0,
                 "throughput_score": 0.0,
                 "combined_score": 0.0,
-                "pre_known_transactions_throughput": 0.0,
+                "pre_known_transactions_under_high_contention": 0.0,
+                "pre_known_transactions_normal_scenario": 0.0,
             },
             artifacts={
                 "error_type": "TimeoutError",
@@ -172,7 +180,8 @@ def evaluate(program_path: str) -> EvaluationResult:
                 "correctness": 0.0,
                 "throughput_score": 0.0,
                 "combined_score": 0.0,
-                "pre_known_transactions_throughput": 0.0,
+                "pre_known_transactions_under_high_contention": 0.0,
+                "pre_known_transactions_normal_scenario": 0.0,
             },
             artifacts={
                 "error_type": "JSONDecodeError",
@@ -188,7 +197,8 @@ def evaluate(program_path: str) -> EvaluationResult:
                 "correctness": 0.0,
                 "throughput_score": 0.0,
                 "combined_score": 0.0,
-                "pre_known_transactions_throughput": 0.0,
+                "pre_known_transactions_under_high_contention": 0.0,
+                "pre_known_transactions_normal_scenario": 0.0,
             },
             artifacts={
                 "error_type": type(e).__name__,
