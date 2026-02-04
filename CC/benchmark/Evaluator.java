@@ -1445,7 +1445,7 @@ public class Evaluator {
                 if (throughputs.containsKey("tpcc_wh8")) 
                     metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_wh8")));
                 else if (throughputs.containsKey("tpcc_contention_very_low"))
-                    metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_contention_low")));
+                    metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_contention_very_low")));
 
                 
 
