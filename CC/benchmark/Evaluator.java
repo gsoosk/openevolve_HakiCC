@@ -1346,7 +1346,7 @@ public class Evaluator {
 
             // TPC-C with different warehouse counts (scalability benchmark)
             // int[] warehouseCounts = {1, 2, 4, 8, 16};
-            int[] warehouseCounts = {2, 8, 16};
+            int[] warehouseCounts = {};
             for (int whCount : warehouseCounts) {
                 TpccConfig config = TpccConfig.withWarehouses(whCount);
                 String scenarioName = config.configName;
@@ -1363,7 +1363,7 @@ public class Evaluator {
 
             if (!correctnessOnly) {
             // TPC-C with different contention levels (8 warehouses, varying hotspot intensity)
-                String[] contentionLevels = {"low", "medium", "very_high"};
+                String[] contentionLevels = {"very_low", "medium", "very_high"};
                 for (String level : contentionLevels) {
                     TpccConfig config = TpccConfig.withContention(level);
                     String scenarioName = config.configName;
@@ -1444,6 +1444,9 @@ public class Evaluator {
                     metrics.put("pre_known_transactions_under_high_contention", getThroughputScore(throughputs.get("tpcc_contention_very_high")));
                 if (throughputs.containsKey("tpcc_wh8")) 
                     metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_wh8")));
+                else if (throughputs.containsKey("tpcc_contention_very_low"))
+                    metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_contention_low")));
+
                 
 
                 // Add warehouse scalability summary

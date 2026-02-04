@@ -1,4 +1,4 @@
-max_iterations: 1000
+max_iterations: 800
 checkpoint_interval: 2
 log_level: "INFO"
 suffix: ".java"
@@ -30,7 +30,7 @@ prompt:
     and **progress** (no stalled threads under deadlock-prone workloads).
 
     The only code the system will evolve is inside the `EVOLVE-BLOCK` in
-    `InitialProgram.java`, where a class derived from `ConcurrencyControl` is
+    where a class derived from `ConcurrencyControl` is
     defined (e.g. `GeneratedCC`). Do NOT modify any code outside the evolve
     block.
 
@@ -102,18 +102,8 @@ prompt:
     Pre-known transactions workload:
       ```java
         // ---------- TPC-C Workload ----------
-
-        static final int TPCC_NUM_WAREHOUSES = 8;
-        static final int TPCC_DISTRICTS_PER_WH = 10;
-        static final int TPCC_CUSTOMERS_PER_DIST = 100;
-        static final int TPCC_NUM_ITEMS = 1000;
-        static final int TPCC_INITIAL_STOCK = 100;
-        static final int TPCC_INITIAL_BALANCE = 10000;
-        static final int TPCC_INITIAL_YTD = 0;
-
         // Initializes the TPCC dataset on the provided key-value store.
         static void initTpccData(KVStore store) {
-            java.util.Random rand = new java.util.Random(42);  // Fixed seed for reproducibility
 
             // Initialize warehouses
             for (int wid = 1; wid <= TPCC_NUM_WAREHOUSES; wid++) {
@@ -262,7 +252,7 @@ prompt:
 
 # Database configuration
 database:
-  population_size: 1000
+  population_size: 800
   archive_size: 100
 
   # Island-based evolution settings
