@@ -1384,7 +1384,7 @@ public class Evaluator {
             double totalThroughput = 0.0;
 
             int tpccCoefficient = 5;
-            int otherCoefficient = 1;
+            int otherCoefficient = 0;
             int weightedScenarios = 0;
 
             Map<String, Double> throughputs = new LinkedHashMap<>();

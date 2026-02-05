@@ -79,7 +79,7 @@ prompt:
           * `throughput_score`: normalized average throughput score across all scenarios
           * `pre_known_transactions_under_high_contention`: throughput score for TPC-C under very high contention (hot items/warehouses). This tests your algorithm's ability to handle extreme contention.
           * `pre_known_transactions_normal_scenario`: throughput score for TPC-C with 8 warehouses (normal scenario). This is the most important workload to achieve high throughput on.
-          * `combined_score`: weighted combination of correctness and throughput scores. 
+          * `combined_score`: weighted combination of correctness and throughput scores. MOST IMPORTANT METRIC TO OPTIMIZE.
         
 
     Optimize your CC algorithm so that:
@@ -256,8 +256,8 @@ database:
   archive_size: 100
 
   # Island-based evolution settings
-  num_islands: 10                    # Number of separate populations
-  migration_interval: 25            # Migrate every 50 generations
+  num_islands: 3                    # Number of separate populations
+  migration_interval: 50            # Migrate every 50 generations
   migration_rate: 0.15               # Migrate 10% of top programs
   
 
