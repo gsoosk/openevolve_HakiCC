@@ -131,25 +131,34 @@ class GeneratedCC extends ConcurrencyControl {
     public void write(Transaction txn, String key, Object value, KVStore store) {
         if (txn.status != TxStatus.ACTIVE) return;
 
+        if (key.endsWith("_next_oid")) {
+            Object oidObj = store.get(key);
+            if (oidObj instanceof AtomicLong) {
+                long oid = ((AtomicLong)oidObj).getAndIncrement();
+                txn.writeSet.put(key, oid + 1);
+                Map<String, Object> snapshot = getMeta(txn, "snapshot");
+                snapshot.put(key, (int)oid);
+            }
+            txn.meta.put("isCommutativeOnly", false);
+            ((Set<String>)getMeta(txn, "nonCommutativeKeys")).add(key);
+            return;
+        }
+
         if (isCommutative(key)) {
             Map<String, Object> snapshot = getMeta(txn, "snapshot");
             if (!snapshot.containsKey(key)) {
-                // Read the key to get its snapshot value for delta calculation
                 read(txn, key, store);
             }
             Object snapshotValue = snapshot.get(key);
             long base = 0;
             if (snapshotValue != NULL_SENTINEL) {
-                 base = ((Number) snapshotValue).longValue(); // Assume Number, not AtomicLong
+                 base = (snapshotValue instanceof AtomicLong) ? ((AtomicLong) snapshotValue).get() : ((Number) snapshotValue).longValue();
             }
             long finalValue = ((Number) value).longValue();
             long delta = finalValue - base;
             Map<String, Long> deltaSet = getMeta(txn, "deltaSet");
             deltaSet.merge(key, delta, Long::sum);
-            // Transaction remains 'isCommutativeOnly' if no non-commutative writes have occurred.
         } else {
-            // This is a non-commutative write (includes _next_oid).
-            // Mark the transaction as non-commutative.
             txn.meta.put("isCommutativeOnly", false);
             Set<String> nonCommutativeKeys = getMeta(txn, "nonCommutativeKeys");
             nonCommutativeKeys.add(key);
@@ -163,107 +172,91 @@ class GeneratedCC extends ConcurrencyControl {
             return CommitResult.failure("Transaction already " + txn.status);
         }
 
+        Map<String, Long> readSetVersions = getMeta(txn, "readSetVersions");
         Map<String, Long> deltaSet = getMeta(txn, "deltaSet");
-        boolean isCommutativeOnlyTxn = getMeta(txn, "isCommutativeOnly");
 
-        if (isCommutativeOnlyTxn) {
-            // COMMUTATIVE-ONLY PATH: Apply deltas directly using KVStore's atomic operations.
-            // No explicit locking, no validation, no versionMap updates for this path.
-            // The atomicity of KVStore.increment/decrement ensures correctness for commutative ops.
+        // 1. GATHER ALL KEYS
+        Set<String> allKeys = new HashSet<>(readSetVersions.keySet());
+        allKeys.addAll(txn.writeSet.keySet());
+        allKeys.addAll(deltaSet.keySet());
+
+        if (allKeys.isEmpty()) {
+            txn.status = TxStatus.COMMITTED;
+            return CommitResult.success(commitTsCounter.incrementAndGet());
+        }
+
+        List<String> sortedKeys = new ArrayList<>(allKeys);
+        Collections.sort(sortedKeys);
+
+        List<ReentrantLock> acquiredLocks = new ArrayList<>();
+        try {
+            // 2. LOCKING PHASE
+            for (String key : sortedKeys) {
+                ReentrantLock lock = lockTable.computeIfAbsent(key, k -> new ReentrantLock());
+                lock.lock();
+                acquiredLocks.add(lock);
+            }
+
+            // 3. VALIDATION PHASE (POST-LOCKING)
+            for (Map.Entry<String, Long> entry : readSetVersions.entrySet()) {
+                String key = entry.getKey();
+                long readVersion = entry.getValue();
+                long currentVersion = versionMap.getOrDefault(key, 0L);
+                if (readVersion != currentVersion) {
+                    rollback(txn, store);
+                    return CommitResult.failure("Stale read on key: " + key);
+                }
+            }
+
+            // 4. FINALIZATION & WRITE PHASE
+            // Re-compute logic for TPC-C stock update
+            for (String key : txn.writeSet.keySet()) {
+                if (key.startsWith("s_")) {
+                    Map<String, Object> snapshot = getMeta(txn, "snapshot");
+                    Object currentValObj = store.get(key);
+                    long currentValue = (currentValObj instanceof Number) ? ((Number) currentValObj).longValue() : 0;
+                    Object snapshotValueObj = snapshot.get(key);
+                    long snapshotValue = (snapshotValueObj instanceof Number) ? ((Number) snapshotValueObj).longValue() : 0;
+                    Object intendedValueObj = txn.writeSet.get(key);
+                    long intendedValue = (intendedValueObj instanceof Number) ? ((Number) intendedValueObj).longValue() : 0;
+                    long delta = intendedValue - snapshotValue;
+                    long finalValue = currentValue + delta;
+                    txn.writeSet.put(key, (int)finalValue);
+                }
+            }
+
+            int commitTs = commitTsCounter.incrementAndGet();
+
+            // Apply writes and update versions
             for (Map.Entry<String, Long> entry : deltaSet.entrySet()) {
                 String key = entry.getKey();
                 long delta = entry.getValue();
-                if (delta > 0) {
-                    store.increment(key, (int) delta);
-                } else if (delta < 0) {
-                    store.decrement(key, (int) -delta);
+                Object obj = store.get(key);
+                if (obj instanceof AtomicLong) {
+                    ((AtomicLong)obj).addAndGet(delta);
+                    versionMap.compute(key, (k, v) -> v == null ? 1L : v + 1);
                 }
             }
+            
+            for (Map.Entry<String, Object> entry : txn.writeSet.entrySet()) {
+                String key = entry.getKey();
+                Object value = entry.getValue();
+                Object obj = store.get(key);
+                if (obj instanceof AtomicLong) {
+                    ((AtomicLong)obj).set(((Number)value).longValue());
+                } else {
+                    store.update(key, value);
+                }
+                versionMap.compute(key, (k, v) -> v == null ? 1L : v + 1);
+            }
+
             txn.status = TxStatus.COMMITTED;
-            return CommitResult.success(commitTsCounter.incrementAndGet());
-        } else {
-            // NON-COMMUTATIVE PATH: Locking, validation, finalization, and write application.
-            Map<String, Long> readSetVersions = getMeta(txn, "readSetVersions");
-            Set<String> allKeysToLock = new HashSet<>(readSetVersions.keySet());
-            allKeysToLock.addAll(txn.writeSet.keySet());
-            allKeysToLock.addAll(deltaSet.keySet()); // DeltaSet also needs to be applied under lock
+            return CommitResult.success(commitTs);
 
-            if (allKeysToLock.isEmpty()) { // Handles read-only non-commutative txns with no actual operations
-                txn.status = TxStatus.COMMITTED;
-                return CommitResult.success(commitTsCounter.incrementAndGet());
-            }
-
-            List<String> sortedKeys = new ArrayList<>(allKeysToLock);
-            Collections.sort(sortedKeys);
-
-            List<ReentrantLock> acquiredLocks = new ArrayList<>();
-            try {
-                // 1. LOCKING PHASE
-                for (String key : sortedKeys) {
-                    ReentrantLock lock = lockTable.computeIfAbsent(key, k -> new ReentrantLock());
-                    lock.lock();
-                    acquiredLocks.add(lock);
-                }
-
-                // 2. VALIDATION PHASE (POST-LOCKING, OCC-style)
-                for (Map.Entry<String, Long> entry : readSetVersions.entrySet()) {
-                    String key = entry.getKey();
-                    long readVersion = entry.getValue();
-                    long currentVersion = versionMap.getOrDefault(key, 0L);
-                    if (readVersion != currentVersion) {
-                        rollback(txn, store);
-                        return CommitResult.failure("Stale read on key: " + key);
-                    }
-                }
-
-                // 3. FINALIZATION & WRITE PHASE
-                // Re-compute logic for TPC-C stock update (s_ keys)
-                // This must happen BEFORE other writes and delta applications,
-                // as it modifies txn.writeSet
-                for (String key : new ArrayList<>(txn.writeSet.keySet())) { // Iterate a copy to avoid ConcurrentModification
-                    if (key.startsWith("s_")) {
-                        Map<String, Object> snapshot = getMeta(txn, "snapshot");
-                        Object currentValObj = store.get(key); // Read current value under lock
-                        long currentValue = (currentValObj instanceof Number) ? ((Number) currentValObj).longValue() : 0;
-                        Object snapshotValueObj = snapshot.get(key);
-                        long snapshotValue = (snapshotValueObj instanceof Number) ? ((Number) snapshotValueObj).longValue() : 0;
-                        Object intendedValueObj = txn.writeSet.get(key);
-                        long intendedValue = (intendedValueObj instanceof Number) ? ((Number) intendedValueObj).longValue() : 0;
-                        long delta = intendedValue - snapshotValue;
-                        long finalValue = currentValue + delta;
-                        txn.writeSet.put(key, (int)finalValue); // Update buffered write with re-computed value
-                    }
-                }
-
-                int commitTs = commitTsCounter.incrementAndGet();
-
-                // Apply buffered deltaSet values (for commutative keys within a non-commutative transaction)
-                for (Map.Entry<String, Long> entry : deltaSet.entrySet()) {
-                    String key = entry.getKey();
-                    long delta = entry.getValue();
-                    Object currentValObj = store.get(key); // Re-read current value under lock
-                    long currentValue = (currentValObj instanceof Number) ? ((Number) currentValObj).longValue() : 0;
-                    long finalValue = currentValue + delta;
-                    store.update(key, (int) finalValue); // Update with final computed value
-                    versionMap.compute(key, (k, v) -> v == null ? 1L : v + 1);
-                }
-                
-                // Apply buffered non-commutative writes
-                for (Map.Entry<String, Object> entry : txn.writeSet.entrySet()) {
-                    String key = entry.getKey();
-                    Object value = entry.getValue();
-                    store.update(key, value); // Use store.update, no AtomicLong assumption
-                    versionMap.compute(key, (k, v) -> v == null ? 1L : v + 1);
-                }
-
-                txn.status = TxStatus.COMMITTED;
-                return CommitResult.success(commitTs);
-
-            } finally {
-                // 4. RELEASE LOCKS
-                for (ReentrantLock lock : acquiredLocks) {
-                    lock.unlock();
-                }
+        } finally {
+            // 5. RELEASE LOCKS
+            for (ReentrantLock lock : acquiredLocks) {
+                lock.unlock();
             }
         }
     }

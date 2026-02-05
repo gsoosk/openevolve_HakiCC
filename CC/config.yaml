@@ -256,10 +256,11 @@ database:
   archive_size: 100
 
   # Island-based evolution settings
-  num_islands: 3                    # Number of separate populations
-  migration_interval: 50            # Migrate every 50 generations
-  migration_rate: 0.1               # Migrate 10% of top programs
+  num_islands: 10                    # Number of separate populations
+  migration_interval: 25            # Migrate every 50 generations
+  migration_rate: 0.15               # Migrate 10% of top programs
   
+
   # Selection parameters
   elite_selection_ratio: 0.1
   exploration_ratio: 0.3
