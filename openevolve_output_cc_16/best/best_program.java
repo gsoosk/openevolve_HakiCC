@@ -77,7 +77,6 @@ class GeneratedCC extends ConcurrencyControl {
         Transaction txn = new Transaction(txid, startTs);
 
         txn.meta.put("isCommutativeOnly", true);
-        txn.meta.put("nonCommutativeKeys", new HashSet<String>());
         txn.meta.put("deltaSet", new ConcurrentHashMap<String, Long>());
         txn.meta.put("snapshot", new ConcurrentHashMap<String, Object>());
         txn.meta.put("readSetVersions", new ConcurrentHashMap<String, Long>());
@@ -131,37 +130,24 @@ class GeneratedCC extends ConcurrencyControl {
     public void write(Transaction txn, String key, Object value, KVStore store) {
         if (txn.status != TxStatus.ACTIVE) return;
 
-        if (key.endsWith("_next_oid")) {
-            Object oidObj = store.get(key);
-            if (oidObj instanceof AtomicLong) {
-                long oid = ((AtomicLong)oidObj).getAndIncrement();
-                txn.writeSet.put(key, oid + 1);
-                Map<String, Object> snapshot = getMeta(txn, "snapshot");
-                snapshot.put(key, (int)oid);
-            }
-            txn.meta.put("isCommutativeOnly", false);
-            ((Set<String>)getMeta(txn, "nonCommutativeKeys")).add(key);
-            return;
-        }
-
         if (isCommutative(key)) {
             Map<String, Object> snapshot = getMeta(txn, "snapshot");
             if (!snapshot.containsKey(key)) {
+                // Ensure key is in snapshot to calculate delta correctly
                 read(txn, key, store);
             }
             Object snapshotValue = snapshot.get(key);
             long base = 0;
             if (snapshotValue != NULL_SENTINEL) {
-                 base = (snapshotValue instanceof AtomicLong) ? ((AtomicLong) snapshotValue).get() : ((Number) snapshotValue).longValue();
+                 base = ((Number) snapshotValue).longValue(); // Assume Integer from KVStore
             }
             long finalValue = ((Number) value).longValue();
             long delta = finalValue - base;
             Map<String, Long> deltaSet = getMeta(txn, "deltaSet");
             deltaSet.merge(key, delta, Long::sum);
         } else {
+            // This path handles non-commutative writes, including _next_oid and s_..._qty.
             txn.meta.put("isCommutativeOnly", false);
-            Set<String> nonCommutativeKeys = getMeta(txn, "nonCommutativeKeys");
-            nonCommutativeKeys.add(key);
             txn.writeSet.put(key, value);
         }
     }
@@ -172,32 +158,40 @@ class GeneratedCC extends ConcurrencyControl {
             return CommitResult.failure("Transaction already " + txn.status);
         }
 
-        Map<String, Long> readSetVersions = getMeta(txn, "readSetVersions");
         Map<String, Long> deltaSet = getMeta(txn, "deltaSet");
+        Map<String, Long> readSetVersions = getMeta(txn, "readSetVersions");
 
-        // 1. GATHER ALL KEYS
-        Set<String> allKeys = new HashSet<>(readSetVersions.keySet());
-        allKeys.addAll(txn.writeSet.keySet());
-        allKeys.addAll(deltaSet.keySet());
+        // 1. GATHER WRITE KEYS for locking. Read keys are validated optimistically.
+        Set<String> writeKeys = new HashSet<>(txn.writeSet.keySet());
+        writeKeys.addAll(deltaSet.keySet());
 
-        if (allKeys.isEmpty()) {
-            txn.status = TxStatus.COMMITTED;
-            return CommitResult.success(commitTsCounter.incrementAndGet());
+        // Handle empty transactions (e.g., read-only, or failed early)
+        // If there are no writes, no locks are needed, just validation of reads.
+        if (writeKeys.isEmpty()) {
+            // If no reads were performed either, it's a truly empty transaction.
+            if (readSetVersions.isEmpty()) {
+                txn.status = TxStatus.COMMITTED;
+                return CommitResult.success(commitTsCounter.incrementAndGet());
+            }
+            // If readSetVersions is NOT empty, it's a read-only transaction.
+            // It will proceed to the validation phase (step 3) but skip the locking phase (step 2).
         }
 
-        List<String> sortedKeys = new ArrayList<>(allKeys);
-        Collections.sort(sortedKeys);
+        List<String> keysToLock = new ArrayList<>(writeKeys);
+
+        List<String> sortedKeys = new ArrayList<>(keysToLock);
+        Collections.sort(sortedKeys); // Canonical order for deadlock prevention
 
         List<ReentrantLock> acquiredLocks = new ArrayList<>();
         try {
-            // 2. LOCKING PHASE
+            // 2. LOCKING PHASE: Acquire locks in a canonical order to prevent deadlocks
             for (String key : sortedKeys) {
                 ReentrantLock lock = lockTable.computeIfAbsent(key, k -> new ReentrantLock());
                 lock.lock();
                 acquiredLocks.add(lock);
             }
 
-            // 3. VALIDATION PHASE (POST-LOCKING)
+            // 3. VALIDATION PHASE (POST-LOCKING): Check if any read values have changed
             for (Map.Entry<String, Long> entry : readSetVersions.entrySet()) {
                 String key = entry.getKey();
                 long readVersion = entry.getValue();
@@ -209,43 +203,48 @@ class GeneratedCC extends ConcurrencyControl {
             }
 
             // 4. FINALIZATION & WRITE PHASE
-            // Re-compute logic for TPC-C stock update
+            // Re-compute logic for TPC-C stock update (s_ keys)
+            // This re-computation must happen *after* locking and *before* applying writes,
+            // and should use the *current* value from the store (which is now locked).
             for (String key : txn.writeSet.keySet()) {
                 if (key.startsWith("s_")) {
                     Map<String, Object> snapshot = getMeta(txn, "snapshot");
-                    Object currentValObj = store.get(key);
+                    Object currentValObj = store.get(key); // Get current value from KVStore (it's locked)
                     long currentValue = (currentValObj instanceof Number) ? ((Number) currentValObj).longValue() : 0;
                     Object snapshotValueObj = snapshot.get(key);
-                    long snapshotValue = (snapshotValueObj instanceof Number) ? ((Number) snapshotValueObj).longValue() : 0;
-                    Object intendedValueObj = txn.writeSet.get(key);
+                    long snapshotValue = (snapshotValueObj == NULL_SENTINEL) ? 0 : ((Number) snapshotValueObj).longValue();
+                    Object intendedValueObj = txn.writeSet.get(key); // This is the value computed based on snapshot
                     long intendedValue = (intendedValueObj instanceof Number) ? ((Number) intendedValueObj).longValue() : 0;
-                    long delta = intendedValue - snapshotValue;
-                    long finalValue = currentValue + delta;
-                    txn.writeSet.put(key, (int)finalValue);
+
+                    long delta = intendedValue - snapshotValue; // Recompute delta based on snapshot and intended value
+                    long finalValue = currentValue + delta; // Apply delta to current value
+
+                    txn.writeSet.put(key, (int)finalValue); // Update buffered write with recomputed value
                 }
             }
 
             int commitTs = commitTsCounter.incrementAndGet();
 
-            // Apply writes and update versions
+            // Apply deltaSet writes using KVStore.increment/decrement
             for (Map.Entry<String, Long> entry : deltaSet.entrySet()) {
                 String key = entry.getKey();
                 long delta = entry.getValue();
-                Object obj = store.get(key);
-                if (obj instanceof AtomicLong) {
-                    ((AtomicLong)obj).addAndGet(delta);
-                    versionMap.compute(key, (k, v) -> v == null ? 1L : v + 1);
+                if (delta > 0) {
+                    store.increment(key, (int)delta); // KVStore.increment takes int delta
+                } else if (delta < 0) {
+                    store.decrement(key, (int)-delta); // KVStore.decrement takes int delta
                 }
+                versionMap.compute(key, (k, v) -> v == null ? 1L : v + 1);
             }
             
+            // Apply writeSet writes using KVStore.update or insert
             for (Map.Entry<String, Object> entry : txn.writeSet.entrySet()) {
                 String key = entry.getKey();
                 Object value = entry.getValue();
-                Object obj = store.get(key);
-                if (obj instanceof AtomicLong) {
-                    ((AtomicLong)obj).set(((Number)value).longValue());
-                } else {
-                    store.update(key, value);
+                if (key.startsWith("o_")) { // New order total key is an insert
+                    store.insert(key, value);
+                } else { // Others are updates (e.g., _next_oid, recomputed s_qty)
+                    store.update(key, value); 
                 }
                 versionMap.compute(key, (k, v) -> v == null ? 1L : v + 1);
             }
