@@ -1205,6 +1205,499 @@ public class Evaluator {
         };
     }
 
+    // ---------- AuctionMark Workload ----------
+
+    static final int AM_NUM_USERS = 1000;
+    static final int AM_NUM_ITEMS = 5000;
+    static final double AM_ZIPF_SELLER_SKEW = 1.2;
+    static final double AM_TEMPORAL_SKEW = 1.5;
+
+    static final int FREQ_NEW_USER = 5;
+    static final int FREQ_NEW_ITEM = 10;
+    static final int FREQ_NEW_BID = 18;
+    static final int FREQ_NEW_COMMENT = 2;
+    static final int FREQ_NEW_COMMENT_RESPONSE = 1;
+    static final int FREQ_NEW_PURCHASE = 2;
+    static final int FREQ_NEW_FEEDBACK = 3;
+    static final int FREQ_GET_ITEM = 40;
+    static final int FREQ_UPDATE_ITEM = 2;
+    static final int FREQ_GET_COMMENT = 2;
+    static final int FREQ_GET_USER_INFO = 10;
+    static final int FREQ_GET_WATCHED_ITEM = 5;
+
+    static class AmConfig {
+        final double sellerSkew;
+        final double temporalSkew;
+        final String configName;
+
+        AmConfig(double sellerSkew, double temporalSkew, String configName) {
+            this.sellerSkew = sellerSkew;
+            this.temporalSkew = temporalSkew;
+            this.configName = configName;
+        }
+
+        static AmConfig withContention(String level) {
+            switch (level) {
+                case "low":
+                    return new AmConfig(0.5, 0.5, "auction_contention_low");
+                case "medium":
+                    return new AmConfig(1.3, 1.3, "auction_contention_medium");
+                case "high":
+                    return new AmConfig(1.5, 1.5, "auction_contention_high");
+                case "extreme":
+                    return new AmConfig(2.0, 2.5, "auction_contention_extreme");
+                default:
+                    return new AmConfig(AM_ZIPF_SELLER_SKEW, AM_TEMPORAL_SKEW, "auction_contention_default");
+            }
+        }
+    }
+
+    /**
+     * O(1) Zipfian sampler using rejection-inversion (Hörmann & Derflinger).
+     * No precomputed arrays — only 5 doubles of state.
+     * Returns values in [1, n] where P(k) ∝ 1/k^exponent.
+     */
+    static class ZipfRNG {
+        private final int n;
+        private final double exponent;
+        private final double oneMinusExp;
+        private final double hIntegralHalf;
+        private final double hIntegralNHalf;
+        private final double threshold;
+
+        ZipfRNG(int n, double exponent) {
+            this.n = n;
+            this.exponent = exponent;
+            this.oneMinusExp = 1.0 - exponent;
+            this.hIntegralHalf = hIntegral(0.5);
+            this.hIntegralNHalf = hIntegral(n + 0.5);
+            this.threshold = hIntegral(1.5) - h(1.0);
+        }
+
+        int sample(Random rand) {
+            while (true) {
+                double u = hIntegralHalf + rand.nextDouble() * (hIntegralNHalf - hIntegralHalf);
+                double x = hIntegralInverse(u);
+                int k = (int) (x + 0.5);
+                if (k < 1) k = 1;
+                else if (k > n) k = n;
+                if (k - x <= threshold || u >= hIntegral(k + 0.5) - h(k)) {
+                    return k;
+                }
+            }
+        }
+
+        private double h(double x) {
+            return Math.exp(-exponent * Math.log(x));
+        }
+
+        private double hIntegral(double x) {
+            if (Math.abs(oneMinusExp) < 1e-12) return Math.log(x);
+            return Math.exp(oneMinusExp * Math.log(x)) / oneMinusExp;
+        }
+
+        private double hIntegralInverse(double x) {
+            if (Math.abs(oneMinusExp) < 1e-12) return Math.exp(x);
+            return Math.exp(Math.log(oneMinusExp * x) / oneMinusExp);
+        }
+    }
+
+    static ZipfRNG amSellerRng;
+    static ZipfRNG amTemporalRng;
+    static int[] amItemSellers;
+    static int[] amItemsByEndTime;
+
+    static int amSelectSeller(Random rand) {
+        return amSellerRng.sample(rand);
+    }
+
+    static int[] amSelectItemAndSeller(Random rand) {
+        int idx = amTemporalRng.sample(rand) - 1;
+        int iid = amItemsByEndTime[idx];
+        int seller = amItemSellers[iid - 1];
+        return new int[]{iid, seller};
+    }
+
+    static void initAuctionMarkData(KVStore store) {
+        initAuctionMarkDataWithConfig(store,
+                new AmConfig(AM_ZIPF_SELLER_SKEW, AM_TEMPORAL_SKEW, "default"));
+    }
+
+    static void initAuctionMarkDataWithConfig(KVStore store, AmConfig config) {
+        Random rand = new Random(42);
+        long now = System.currentTimeMillis();
+
+        amSellerRng = new ZipfRNG(AM_NUM_USERS, config.sellerSkew);
+        amTemporalRng = new ZipfRNG(AM_NUM_ITEMS, config.temporalSkew);
+
+        for (int uid = 1; uid <= AM_NUM_USERS; uid++) {
+            String keyPrefix = "u_" + uid + "_";
+            store.insert(keyPrefix + "rating", 0);
+            store.insert(keyPrefix + "balance", 0.0);
+            store.insert(keyPrefix + "created", now);
+            store.insert(keyPrefix + "r_id", rand.nextInt(62) + 1);
+            for (int i = 0; i < 8; i++) {
+                store.insert(keyPrefix + "sattr" + i, "attr_val_" + rand.nextInt(100));
+            }
+        }
+
+        amItemSellers = new int[AM_NUM_ITEMS];
+        long[] endTimes = new long[AM_NUM_ITEMS];
+
+        for (int iid = 1; iid <= AM_NUM_ITEMS; iid++) {
+            int seller = amSelectSeller(rand);
+            amItemSellers[iid - 1] = seller;
+            long endTime = now + 60_000L + (long) (rand.nextDouble() * 86340000L);
+            endTimes[iid - 1] = endTime;
+
+            String itemKey = "i_" + iid + "_" + seller;
+            double price = rand.nextDouble() * 100 + 1;
+            store.insert(itemKey + "_c_id", rand.nextInt(100) + 1);
+            store.insert(itemKey + "_name", "Item " + iid);
+            store.insert(itemKey + "_desc", "Description for " + iid);
+            store.insert(itemKey + "_price", price);
+            store.insert(itemKey + "_curr_price", price);
+            store.insert(itemKey + "_num_bids", 0);
+            store.insert(itemKey + "_status", 0);
+            store.insert(itemKey + "_start", now);
+            store.insert(itemKey + "_end", endTime);
+        }
+
+        Integer[] sortedIds = new Integer[AM_NUM_ITEMS];
+        for (int i = 0; i < AM_NUM_ITEMS; i++) sortedIds[i] = i + 1;
+        Arrays.sort(sortedIds, Comparator.comparingLong(id -> endTimes[id - 1]));
+        amItemsByEndTime = new int[AM_NUM_ITEMS];
+        for (int i = 0; i < AM_NUM_ITEMS; i++) amItemsByEndTime[i] = sortedIds[i];
+    }
+
+    static Consumer<KVStore> createAmInitializer(AmConfig config) {
+        return store -> initAuctionMarkDataWithConfig(store, config);
+    }
+
+    static boolean amNewUser(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int u_id = rand.nextInt(1000000) + 1000;
+        int u_r_id = rand.nextInt(62) + 1;
+        String keyPrefix = "u_" + u_id + "_";
+
+        r.logWrite(txn, keyPrefix + "rating", 0);
+        r.logWrite(txn, keyPrefix + "balance", 0.0);
+        r.logWrite(txn, keyPrefix + "created", System.currentTimeMillis());
+        r.logWrite(txn, keyPrefix + "r_id", u_r_id);
+        for (int i = 0; i < 8; i++) {
+            r.logWrite(txn, keyPrefix + "sattr" + i, "attr_val_" + rand.nextInt(100));
+        }
+        return true;
+    }
+
+    static boolean amNewItem(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int u_id = amSelectSeller(rand);
+        int i_id = rand.nextInt(1000000) + 1;
+        int c_id = rand.nextInt(100) + 1;
+        double initial_price = rand.nextDouble() * 100 + 1;
+
+        String itemKey = "i_" + i_id + "_" + u_id;
+        r.logWrite(txn, itemKey + "_c_id", c_id);
+        r.logWrite(txn, itemKey + "_name", "Item " + i_id);
+        r.logWrite(txn, itemKey + "_desc", "Description for " + i_id);
+        r.logWrite(txn, itemKey + "_price", initial_price);
+        r.logWrite(txn, itemKey + "_curr_price", initial_price);
+        r.logWrite(txn, itemKey + "_num_bids", 0);
+        r.logWrite(txn, itemKey + "_status", 0);
+        r.logWrite(txn, itemKey + "_start", System.currentTimeMillis());
+        r.logWrite(txn, itemKey + "_end", System.currentTimeMillis() + 86400000L);
+
+        String userBalKey = "u_" + u_id + "_balance";
+        Object balObj = r.logRead(txn, userBalKey);
+        double bal = (balObj instanceof Double) ? (Double) balObj : 0.0;
+        r.logWrite(txn, userBalKey, bal - 1.0);
+        return true;
+    }
+
+    static boolean amNewBid(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int[] itemSeller = amSelectItemAndSeller(rand);
+        int i_id = itemSeller[0];
+        int u_id = itemSeller[1];
+        int buyer_id = rand.nextInt(AM_NUM_USERS) + 1;
+        if (u_id == buyer_id) return false;
+
+        String itemKey = "i_" + i_id + "_" + u_id;
+        Object statusObj = r.logRead(txn, itemKey + "_status");
+        int status = (statusObj instanceof Integer) ? (Integer) statusObj : -1;
+        if (status != 0) return false;
+
+        double bid = rand.nextDouble() * 50 + 10;
+        double maxBid = bid + 10.0;
+
+        String itemMaxBidKey = "imb_" + i_id + "_" + u_id;
+        Object currentMaxBidObj = r.logRead(txn, itemMaxBidKey + "_max_bid");
+        double currentMaxBid = (currentMaxBidObj instanceof Double) ? (Double) currentMaxBidObj : 0.0;
+        if (bid <= currentMaxBid) return false;
+
+        Object numBidsObj = r.logRead(txn, itemKey + "_num_bids");
+        int numBids = (numBidsObj instanceof Integer) ? (Integer) numBidsObj : 0;
+        r.logWrite(txn, itemKey + "_num_bids", numBids + 1);
+
+        int ib_id = numBids + 1;
+        String bidKey = "ib_" + i_id + "_" + u_id + "_" + ib_id;
+        r.logWrite(txn, bidKey + "_buyer", buyer_id);
+        r.logWrite(txn, bidKey + "_bid", bid);
+        r.logWrite(txn, bidKey + "_max", maxBid);
+        r.logWrite(txn, bidKey + "_date", System.currentTimeMillis());
+
+        r.logWrite(txn, itemMaxBidKey + "_ib_id", ib_id);
+        r.logWrite(txn, itemMaxBidKey + "_max_bid", maxBid);
+        return true;
+    }
+
+    static boolean amNewComment(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int[] itemSeller = amSelectItemAndSeller(rand);
+        int i_id = itemSeller[0];
+        int u_id = itemSeller[1];
+        int buyer_id = rand.nextInt(AM_NUM_USERS) + 1;
+
+        String commentCounterKey = "cnt_ic_" + i_id + "_" + u_id;
+        Object cntObj = r.logRead(txn, commentCounterKey);
+        int ic_id = (cntObj instanceof Integer) ? (Integer) cntObj + 1 : 1;
+        r.logWrite(txn, commentCounterKey, ic_id);
+
+        String commentKey = "ic_" + i_id + "_" + u_id + "_" + ic_id;
+        r.logWrite(txn, commentKey + "_buyer", buyer_id);
+        r.logWrite(txn, commentKey + "_question", "Question about item?");
+        r.logWrite(txn, commentKey + "_date", System.currentTimeMillis());
+        return true;
+    }
+
+    static boolean amNewCommentResponse(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int[] itemSeller = amSelectItemAndSeller(rand);
+        int i_id = itemSeller[0];
+        int u_id = itemSeller[1];
+        int ic_id = rand.nextInt(5) + 1;
+
+        String commentKey = "ic_" + i_id + "_" + u_id + "_" + ic_id;
+        if (r.logRead(txn, commentKey + "_question") == null) return false;
+        r.logWrite(txn, commentKey + "_response", "This is the response.");
+        return true;
+    }
+
+    static boolean amNewPurchase(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int[] itemSeller = amSelectItemAndSeller(rand);
+        int i_id = itemSeller[0];
+        int u_id = itemSeller[1];
+
+        String itemKey = "i_" + i_id + "_" + u_id;
+        Object statusObj = r.logRead(txn, itemKey + "_status");
+        int status = (statusObj instanceof Integer) ? (Integer) statusObj : -1;
+        if (status != 1) return false;
+
+        String itemMaxBidKey = "imb_" + i_id + "_" + u_id;
+        Object winBidIdObj = r.logRead(txn, itemMaxBidKey + "_ib_id");
+        int ib_id = (winBidIdObj instanceof Integer) ? (Integer) winBidIdObj : -1;
+
+        String bidKey = "ib_" + i_id + "_" + u_id + "_" + ib_id;
+        r.logRead(txn, bidKey + "_buyer");
+
+        int ip_id = rand.nextInt(10000);
+        String purchaseKey = "ip_" + ip_id;
+        r.logWrite(txn, purchaseKey + "_ib_id", ib_id);
+        r.logWrite(txn, purchaseKey + "_i_id", i_id);
+        r.logWrite(txn, purchaseKey + "_u_id", u_id);
+        r.logWrite(txn, purchaseKey + "_date", System.currentTimeMillis());
+
+        r.logWrite(txn, itemKey + "_status", 2);
+        return true;
+    }
+
+    static boolean amNewFeedback(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int[] itemSeller = amSelectItemAndSeller(rand);
+        int i_id = itemSeller[0];
+        int u_id = itemSeller[1];
+        int buyer_id = rand.nextInt(AM_NUM_USERS) + 1;
+        int rating = rand.nextInt(3) - 1;
+
+        int if_id = rand.nextInt(10000);
+        String feedbackKey = "if_" + i_id + "_" + u_id + "_" + if_id;
+        r.logWrite(txn, feedbackKey + "_buyer", buyer_id);
+        r.logWrite(txn, feedbackKey + "_rating", rating);
+        r.logWrite(txn, feedbackKey + "_comment", "Great seller");
+        r.logWrite(txn, feedbackKey + "_date", System.currentTimeMillis());
+
+        String userKey = "u_" + u_id;
+        Object curRatingObj = r.logRead(txn, userKey + "_rating");
+        int curRating = (curRatingObj instanceof Integer) ? (Integer) curRatingObj : 0;
+        r.logWrite(txn, userKey + "_rating", curRating + rating);
+        return true;
+    }
+
+    static boolean amGetItem(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int[] itemSeller = amSelectItemAndSeller(rand);
+        int i_id = itemSeller[0];
+        int u_id = itemSeller[1];
+        String itemKey = "i_" + i_id + "_" + u_id;
+
+        r.logRead(txn, itemKey + "_name");
+        r.logRead(txn, itemKey + "_price");
+        r.logRead(txn, itemKey + "_desc");
+        r.logRead(txn, itemKey + "_end");
+        return true;
+    }
+
+    static boolean amUpdateItem(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int[] itemSeller = amSelectItemAndSeller(rand);
+        int i_id = itemSeller[0];
+        int u_id = itemSeller[1];
+        String itemKey = "i_" + i_id + "_" + u_id;
+
+        Object statusObj = r.logRead(txn, itemKey + "_status");
+        int status = (statusObj instanceof Integer) ? (Integer) statusObj : -1;
+        if (status == 0) {
+            r.logWrite(txn, itemKey + "_desc", "Updated Description " + System.currentTimeMillis());
+            return true;
+        }
+        return false;
+    }
+
+    static boolean amGetComment(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int u_id = amSelectSeller(rand);
+
+        for (int k = 1; k <= 3; k++) {
+            int[] itemSeller = amSelectItemAndSeller(rand);
+            int i_id = itemSeller[0];
+            String commentKey = "ic_" + i_id + "_" + u_id + "_" + k;
+            r.logRead(txn, commentKey + "_question");
+        }
+        return true;
+    }
+
+    static boolean amGetUserInfo(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int u_id = amSelectSeller(rand);
+        String userKey = "u_" + u_id;
+
+        r.logRead(txn, userKey + "_balance");
+        r.logRead(txn, userKey + "_rating");
+
+        for (int k = 0; k < 5; k++) {
+            int[] itemSeller = amSelectItemAndSeller(rand);
+            int i_id = itemSeller[0];
+            r.logRead(txn, "i_" + i_id + "_" + u_id + "_status");
+        }
+        return true;
+    }
+
+    static boolean amGetWatchedItems(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        int u_id = rand.nextInt(AM_NUM_USERS) + 1;
+
+        for (int k = 0; k < 3; k++) {
+            int[] itemSeller = amSelectItemAndSeller(rand);
+            int i_id = itemSeller[0];
+            int seller_id = itemSeller[1];
+            r.logRead(txn, "i_" + i_id + "_" + seller_id + "_curr_price");
+        }
+        return true;
+    }
+
+    static List<String> amCheckWinningBids(ConcurrentRunner r, Transaction txn) {
+        List<String> dueItems = new ArrayList<>();
+        Random rand = ThreadLocalRandom.current();
+        long now = System.currentTimeMillis();
+
+        for (int i = 0; i < 10; i++) {
+            int[] itemSeller = amSelectItemAndSeller(rand);
+            int i_id = itemSeller[0];
+            int u_id = itemSeller[1];
+            String itemKey = "i_" + i_id + "_" + u_id;
+
+            Object endObj = r.logRead(txn, itemKey + "_end");
+            long endTime = (endObj instanceof Long) ? (Long) endObj : Long.MAX_VALUE;
+
+            Object statusObj = r.logRead(txn, itemKey + "_status");
+            int status = (statusObj instanceof Integer) ? (Integer) statusObj : -1;
+
+            if (status == 0 && endTime < now) {
+                dueItems.add(itemKey);
+            }
+        }
+        return dueItems;
+    }
+
+    static boolean amPostAuction(ConcurrentRunner r, Transaction txn, List<String> dueItems) {
+        if (dueItems == null || dueItems.isEmpty()) return true;
+
+        for (String itemKey : dueItems) {
+            String[] parts = itemKey.split("_");
+            int i_id = Integer.parseInt(parts[1]);
+            int u_id = Integer.parseInt(parts[2]);
+
+            String maxBidKey = "imb_" + i_id + "_" + u_id + "_ib_id";
+            Object bidIdObj = r.logRead(txn, maxBidKey);
+
+            if (bidIdObj == null) {
+                r.logWrite(txn, itemKey + "_status", 2);
+            } else {
+                r.logWrite(txn, itemKey + "_status", 1);
+                int buyer_id = 999;
+                String uiKey = "ui_" + buyer_id + "_" + i_id;
+                r.logWrite(txn, uiKey + "_created", System.currentTimeMillis());
+            }
+        }
+        return true;
+    }
+
+    static void wlAuctionMark(ConcurrentRunner r, Transaction txn) {
+        Random rand = ThreadLocalRandom.current();
+        boolean success;
+
+        int roll = rand.nextInt(100) + 1;
+
+        if (roll <= FREQ_NEW_USER) {
+            success = amNewUser(r, txn);
+        } else if (roll <= FREQ_NEW_USER + FREQ_NEW_ITEM) {
+            success = amNewItem(r, txn);
+        } else if (roll <= 15 + FREQ_NEW_BID) {
+            success = amNewBid(r, txn);
+        } else if (roll <= 33 + FREQ_NEW_COMMENT) {
+            success = amNewComment(r, txn);
+        } else if (roll <= 35 + FREQ_NEW_COMMENT_RESPONSE) {
+            success = amNewCommentResponse(r, txn);
+        } else if (roll <= 36 + FREQ_NEW_PURCHASE) {
+            success = amNewPurchase(r, txn);
+        } else if (roll <= 38 + FREQ_NEW_FEEDBACK) {
+            success = amNewFeedback(r, txn);
+        } else if (roll <= 41 + FREQ_GET_ITEM) {
+            success = amGetItem(r, txn);
+        } else if (roll <= 81 + FREQ_UPDATE_ITEM) {
+            success = amUpdateItem(r, txn);
+        } else if (roll <= 83 + FREQ_GET_COMMENT) {
+            success = amGetComment(r, txn);
+        } else if (roll <= 85 + FREQ_GET_USER_INFO) {
+            success = amGetUserInfo(r, txn);
+        } else {
+            success = amGetWatchedItems(r, txn);
+        }
+
+        if (rand.nextInt(1000) == 0) {
+            List<String> due = amCheckWinningBids(r, txn);
+            amPostAuction(r, txn, due);
+        }
+
+        if (success) {
+            r.logCommit(txn);
+        } else {
+            r.logRollback(txn);
+        }
+    }
+
     // ---------- Scenario running ----------
 
     static class ScenarioResult {
@@ -1323,16 +1816,19 @@ public class Evaluator {
     // ---------- Main evaluate method ----------
 
     public static EvaluationResult evaluate(Supplier<ConcurrencyControl> ccFactory) {
-        return evaluate(ccFactory, false);
+        return evaluate(ccFactory, false, "tpcc");
+    }
+
+    public static EvaluationResult evaluate(Supplier<ConcurrencyControl> ccFactory, boolean correctnessOnly) {
+        return evaluate(ccFactory, correctnessOnly, "tpcc");
     }
 
     private static double getThroughputScore(double throughput) {
         double MAX_TPCC_THROUGHPUT = 600_000.0;
-        // return Math.pow(Math.log(throughput + 1) / Math.log(MAX_TPCC_THROUGHPUT + 1), 10);
         return throughput / (MAX_TPCC_THROUGHPUT);
     }
 
-    public static EvaluationResult evaluate(Supplier<ConcurrencyControl> ccFactory, boolean correctnessOnly) {
+    public static EvaluationResult evaluate(Supplier<ConcurrencyControl> ccFactory, boolean correctnessOnly, String preKnownTxnType) {
         try {
             Map<String, ScenarioResult> scenarios = new LinkedHashMap<>();
 
@@ -1344,9 +1840,22 @@ public class Evaluator {
             // TPC-C with default 8 warehouses (for backwards compatibility)
             // scenarios.put("tpcc", runScenario(ccFactory, Evaluator::wlTpcc, 64, 5.0, 0.5, Evaluator::initTpccData));
 
+            // AuctionMark benchmark (low + high contention always run for correctness)
+            for (String level : new String[]{"low", "high"}) {
+                AmConfig amConfig = AmConfig.withContention(level);
+                System.out.println("Running AuctionMark with contention level: " + level + "...");
+                scenarios.put(amConfig.configName, runScenario(
+                        ccFactory,
+                        Evaluator::wlAuctionMark,
+                        64,
+                        5.0,
+                        0.2,
+                        createAmInitializer(amConfig)
+                ));
+            }
+
             // TPC-C with different warehouse counts (scalability benchmark)
-            // int[] warehouseCounts = {1, 2, 4, 8, 16};
-            int[] warehouseCounts = {};
+            int[] warehouseCounts = {1, 2, 4, 8, 16};
             for (int whCount : warehouseCounts) {
                 TpccConfig config = TpccConfig.withWarehouses(whCount);
                 String scenarioName = config.configName;
@@ -1356,14 +1865,29 @@ public class Evaluator {
                         createTpccWorkload(config),
                         64,
                         5.0,
-                        0.5,
+                        0.2,
                         createTpccInitializer(config)
                 ));
             }
 
             if (!correctnessOnly) {
+            // AuctionMark with additional contention levels (medium + extreme)
+                String[] amContentionLevels = {"medium", "extreme"};
+                for (String level : amContentionLevels) {
+                    AmConfig amConfig = AmConfig.withContention(level);
+                    System.out.println("Running AuctionMark with contention level: " + level + "...");
+                    scenarios.put(amConfig.configName, runScenario(
+                            ccFactory,
+                            Evaluator::wlAuctionMark,
+                            64,
+                            5.0,
+                            0.2,
+                            createAmInitializer(amConfig)
+                    ));
+                }
+
             // TPC-C with different contention levels (8 warehouses, varying hotspot intensity)
-                String[] contentionLevels = {"very_low", "medium", "very_high"};
+                String[] contentionLevels = {"very_low", "low", "medium", "high", "very_high", "extreme"};
                 for (String level : contentionLevels) {
                     TpccConfig config = TpccConfig.withContention(level);
                     String scenarioName = config.configName;
@@ -1383,9 +1907,10 @@ public class Evaluator {
             int correct = 0;
             double totalThroughput = 0.0;
 
-            int tpccCoefficient = 5;
-            int otherCoefficient = 0;
+            int preKnownCoefficient = 5;
+            int otherCoefficient = 1;
             int weightedScenarios = 0;
+            String preKnownPrefix = preKnownTxnType.equals("auction") ? "auction" : "tpcc";
 
             Map<String, Double> throughputs = new LinkedHashMap<>();
 
@@ -1404,10 +1929,9 @@ public class Evaluator {
                     correct++;
                 }
 
-                // Weight TPC-C scenarios higher
-                if (name.startsWith("tpcc")) {
-                    totalThroughput += s.throughput * tpccCoefficient;
-                    weightedScenarios += tpccCoefficient;
+                if (name.startsWith(preKnownPrefix)) {
+                    totalThroughput += s.throughput * preKnownCoefficient;
+                    weightedScenarios += preKnownCoefficient;
                 } else {
                     totalThroughput += s.throughput * otherCoefficient;
                     weightedScenarios += otherCoefficient;
@@ -1428,6 +1952,14 @@ public class Evaluator {
             }
             Map<String, Double> tpccThroughputs = throughputs.entrySet().stream().filter(entry -> entry.getKey().startsWith("tpcc_")).collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
             artifacts.put("tpcc_avg_throughputs",  tpccThroughputs.values().stream().mapToDouble(Double::doubleValue).average().orElse(0.0));
+            Map<String, Double> auctionThroughputs = throughputs.entrySet().stream()
+                    .filter(entry -> entry.getKey().startsWith("auction_"))
+                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+            if (!auctionThroughputs.isEmpty()) {
+                artifacts.put("auction_avg_throughput", auctionThroughputs.values().stream()
+                        .mapToDouble(Double::doubleValue).average().orElse(0.0));
+            }
+            artifacts.put("pre_known_txn_type", preKnownTxnType);
             artifacts.put("scenario_summaries", scenarioSummaries);
 
             // Only add other metrics if not in correctness-only mode
@@ -1440,13 +1972,18 @@ public class Evaluator {
 
                 metrics.put("throughput_score", throughputScore);
                 metrics.put("combined_score", combinedScore);
-                if (throughputs.containsKey("tpcc_contention_very_high")) 
-                    metrics.put("pre_known_transactions_under_high_contention", getThroughputScore(throughputs.get("tpcc_contention_very_high")));
-                if (throughputs.containsKey("tpcc_wh8")) 
-                    metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_wh8")));
-                else if (throughputs.containsKey("tpcc_contention_very_low"))
-                    metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_contention_very_low")));
 
+                if (preKnownTxnType.equals("auction")) {
+                    if (throughputs.containsKey("auction_contention_extreme"))
+                        metrics.put("pre_known_transactions_under_high_contention", getThroughputScore(throughputs.get("auction_contention_extreme")));
+                    if (throughputs.containsKey("auction_contention_low"))
+                        metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("auction_contention_low")));
+                } else {
+                    if (throughputs.containsKey("tpcc_contention_very_high"))
+                        metrics.put("pre_known_transactions_under_high_contention", getThroughputScore(throughputs.get("tpcc_contention_very_high")));
+                    if (throughputs.containsKey("tpcc_wh8"))
+                        metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_wh8")));
+                }
                 
 
                 // Add warehouse scalability summary
@@ -1589,6 +2126,7 @@ public class Evaluator {
     public static void main(String[] args) {
         String outputFile = "output.json";
         boolean correctnessOnly = false;
+        String preKnownTxnType = "tpcc";
         
         // Parse arguments
         for (int i = 0; i < args.length; i++) {
@@ -1597,15 +2135,19 @@ public class Evaluator {
                 i++;
             } else if ("--correctness-only".equals(args[i])) {
                 correctnessOnly = true;
+            } else if ("--pre-known-txn".equals(args[i]) && i + 1 < args.length) {
+                preKnownTxnType = args[i + 1];
+                i++;
             }
         }
 
         System.out.println("Running evaluator with GeneratedCC...");
+        System.out.println("Pre-known transaction type: " + preKnownTxnType);
         if (correctnessOnly) {
             System.out.println("Correctness-only mode enabled: only correctness metric will be reported.");
         }
 
-        EvaluationResult result = evaluate(GeneratedCC::buildCc, correctnessOnly);
+        EvaluationResult result = evaluate(GeneratedCC::buildCc, correctnessOnly, preKnownTxnType);
 
         System.out.println("Evaluation complete.");
         System.out.println("Metrics: " + result.metrics);

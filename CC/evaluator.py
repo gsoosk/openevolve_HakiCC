@@ -17,6 +17,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, Any, Union
 
+# Pre-known transaction type for throughput scoring
+# Valid values: "tpcc" or "auction"
+# This affects which benchmark scenarios get priority weighting in the combined_score
+# Read from environment variable PRE_KNOWN_TXN_TYPE, default to "tpcc"
+PRE_KNOWN_TXN_TYPE = os.environ.get("PRE_KNOWN_TXN_TYPE", "tpcc")
+
 # Try to import from openevolve, fall back to local definition for standalone use
 try:
     from openevolve.evaluation_result import EvaluationResult
@@ -82,9 +88,14 @@ def evaluate(program_path: str) -> EvaluationResult:
             # Run the Java evaluator
             logger.info(f"Running Java evaluator for: {program_path}")
             logger.info(f"Output file: {output_file}")
+            logger.info(f"Pre-known transaction type: {PRE_KNOWN_TXN_TYPE}")
 
             result = subprocess.run(
-                ["bash", run_script, program_path, output_file],
+                [
+                    "bash", run_script, 
+                    program_path, output_file, 
+                    "--pre-known-txn", PRE_KNOWN_TXN_TYPE
+                ],
                 cwd=benchmark_dir,
                 capture_output=True,
                 text=True,

@@ -1,20 +1,45 @@
 #!/bin/bash
 
 # Run the Java CC Evaluator
-# Usage: ./run_evaluator.sh [InitialProgram.java] [output.json]
+# Usage: ./run_evaluator.sh [InitialProgram.java] [output.json] [--pre-known-txn tpcc|auction]
 #
 # Arguments:
 #   InitialProgram.java - Path to the CC implementation file (default: InitialProgram.java)
 #   output.json         - Path to output JSON file (default: output.json)
+#   --pre-known-txn     - Pre-known transaction type: "tpcc" or "auction" (default: tpcc)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Default values
+INPUT_FILE=""
+OUTPUT_FILE=""
+PRE_KNOWN_TXN="tpcc"
+
 # Parse arguments
-INPUT_FILE="${1:-InitialProgram.java}"
-OUTPUT_FILE="${2:-output.json}"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --pre-known-txn)
+            PRE_KNOWN_TXN="$2"
+            shift 2
+            ;;
+        *)
+            # Positional arguments: first is input file, second is output file
+            if [ -z "$INPUT_FILE" ]; then
+                INPUT_FILE="$1"
+            elif [ -z "$OUTPUT_FILE" ]; then
+                OUTPUT_FILE="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Apply defaults for positional arguments
+INPUT_FILE="${INPUT_FILE:-InitialProgram.java}"
+OUTPUT_FILE="${OUTPUT_FILE:-output.json}"
 
 # Check if input file exists
 if [ ! -f "$INPUT_FILE" ]; then
@@ -44,7 +69,8 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Running evaluator..."
-java -Xmx120g benchmark.Evaluator --output "$OUTPUT_FILE"
+echo "Pre-known transaction type: $PRE_KNOWN_TXN"
+java -Xmx120g benchmark.Evaluator --output "$OUTPUT_FILE" --pre-known-txn "$PRE_KNOWN_TXN"
 
 if [ $? -eq 0 ]; then
     echo ""
