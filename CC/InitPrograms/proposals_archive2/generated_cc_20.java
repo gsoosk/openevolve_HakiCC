@@ -25,7 +25,8 @@ The protocol ensures **Strict Serializability**.
 *   **Serializability:** This is guaranteed by the combination of repeatable reads and a strict, atomic commit-time validation. The repeatable read implementation prevents anomalies where a transaction might see inconsistent state. The validation phase ensures that a transaction's entire read set was stable throughout its execution. If T1 reads a key and T2 subsequently modifies it (incrementing either `EMC` or `CMC`), T1's validation will fail, forcing an abort and preventing a serialization cycle.
 *   **Strictness:** All writes are buffered locally and are only applied to the store after a successful commit decision. No uncommitted data is ever visible to other transactions.
 
-**5. Complexity and Performance Notes**
+**5. Complexity and Performt push
+ance Notes**
 *   **Time Complexity:** `read`, `write`, `begin`, `rollback` are all O(1) on average. `commit` is O(R+W), where R and W are the sizes of the read and write sets, performed under a lock.
 *   **Performance:** The protocol demonstrates high throughput, particularly for the TPC-C workload. Its primary performance benefit comes from blind read elimination, which prevents the vast majority of conflicts between `NewOrder` and `Payment` transactions. While the strict validation of both counters increases aborts among purely commutative transactions compared to a more lenient design, it is essential for correctness and still allows for a high degree of concurrency.
 
@@ -33,81 +34,7 @@ The protocol ensures **Strict Serializability**.
 *   **Pre-Known Semantics:** The protocol's effectiveness relies on the ability to statically classify keys and operations (e.g., `_ytd` is commutative, `_qty` is exclusive). It is not a general-purpose protocol and would require modification to support ad-hoc workloads.
 *   **Partitioning:** The use of per-partition commit locks is optimized for workloads that can be cleanly partitioned (like TPC-C by warehouse). For workloads with high cross-partition contention, a global lock or a more sophisticated commit mechanism would be needed.
 *   **Abort Rate:** While optimized, the protocol is still optimistic and subject to aborts under high data contention, particularly for transactions with large read sets. The final, correct implementation prioritizes serializability over minimizing the abort rate for commutative transactions.Novelty Result:
-```json
-```json
-{
-    "novelty_score_overall": 44,
-    "verdict": "Incremental Hybrid",
-    "score_breakdown": {
-        "conceptual_originality_40": 25.0,
-        "distance_from_known_families_30": 15.0,
-        "implementation_distinctiveness_15": 5.0,
-        "correctness_argument_originality_10": 4.0,
-        "rebranding_penalty_minus15": -5.0
-    },
-    "separate_scores": {
-        "proposal_novelty": 45,
-        "code_novelty": 42
-    },
-    "overlap_analysis": [
-        {
-            "family": "OCC (Optimistic Concurrency Control)",
-            "overlap_reasoning": "The core mechanism is classic OCC: transactions execute in a private workspace, perform a validation check at commit time, and then apply writes. The use of a short-term lock for the validate-write phase is also a common OCC implementation pattern (e.g., Silo).",
-            "overlap_strength_0_to_100": 90
-        },
-        {
-            "family": "Semantic Concurrency Control",
-            "overlap_reasoning": "The protocol's main contribution is using workload semantics to inform the CC mechanism. It statically classifies operations as 'exclusive' or 'commutative' and uses this to drive metadata updates and (in the initial design) validation rules. This is the definition of semantic CC.",
-            "overlap_strength_0_to_100": 80
-        },
-        {
-            "family": "MVCC (Multi-Version Concurrency Control)",
-            "overlap_reasoning": "While not a full MVCC implementation, the use of multiple counters (`EMC`, `CMC`) to track different *types* of changes to a data item is conceptually similar to how some MVCC systems use multiple timestamps or version pointers to manage visibility. It's a way of storing more history about an item than a single version number.",
-            "overlap_strength_0_to_100": 40
-        }
-    ],
-    "feature_diff": [
-        {
-            "axis": "Validation Metadata",
-            "ours": "Each data item maintains two separate counters: one for exclusive (non-commutative) updates (`EMC`) and one for commutative updates (`CMC`).",
-            "typical_in_nearest_family": "Classic OCC uses a single version number (or timestamp) per data item, which is incremented on any write, regardless of the operation's semantics.",
-            "difference_note": "This dual-counter approach encodes semantic information directly into the item's metadata. While the final correct implementation validates both counters for all transactions (making it functionally equivalent to a single counter), the design itself is distinct and offers a framework for more nuanced validation rules."
-        },
-        {
-            "axis": "Conflict Detection",
-            "ours": "The protocol statically identifies 'blind reads' based on transaction type and key patterns. These reads are completely excluded from the validation set at commit time.",
-            "typical_in_nearest_family": "A typical OCC protocol would include all keys from the read-set in the validation check. It lacks the semantic knowledge to safely ignore certain reads, leading to a higher rate of false-positive aborts.",
-            "difference_note": "This is a powerful, workload-specific optimization. It correctly identifies that certain read-write conflicts are not true dependencies in the serializability graph and prunes them, significantly improving performance for mixed workloads like TPC-C."
-        }
-    ],
-    "code_checks": {
-        "uses_locks_or_lock_modes": true,
-        "uses_versions_or_snapshots": true,
-        "commit_time_validation": true,
-        "timestamp_ordering_core": false,
-        "deterministic_preordering": false,
-        "dependency_graph_cycles": false,
-        "other_key_constructs": [
-            "Dual-counter metadata wrapper (DcovValue)",
-            "Static, key-prefix-based semantic dispatcher (getWriteType)",
-            "Repeatable-read cache enforcement in the read() method"
-        ]
-    },
-    "correctness_rationale_summary": "The final, correct version of the protocol guarantees serializability by combining two principles: 1) Enforcing repeatable reads by caching the first read of any key within a transaction's private workspace. This prevents non-repeatable read anomalies. 2) A strict commit-time validation that checks both the `EMC` and `CMC` counters for all non-blind reads. This ensures that the transaction's entire read-set remained stable throughout its execution. The combination of a stable snapshot and a comprehensive validation check is a standard and sound argument for OCC correctness.",
-    "risks_and_edge_cases": [
-        "The semantic classification (`getWriteType`, `isBlindRead`) is hardcoded and brittle. It works perfectly for the specified workloads but would fail or perform sub-optimally if new transaction types with different semantics were introduced without updating the code.",
-        "The use of a single commit lock per partition serializes the commit phase for that partition. While fast, this could become a bottleneck if a partition experiences a very high rate of conflicting transactions.",
-        "The protocol's performance relies heavily on the 'blind read' optimization. In workloads without this pattern, its performance would degrade to that of a standard OCC protocol, with a higher metadata overhead due to the dual counters."
-    ],
-    "suggestions_to_increase_novelty": [
-        "Develop a dynamic semantic declaration mechanism. Instead of hardcoding `getWriteType`, allow transactions to tag their writes (e.g., `write(key, value, WriteHint.COMMUTATIVE)`). This would generalize the approach beyond the pre-known workload.",
-        "Explore lock-free validation. The per-partition lock is a bottleneck. Research techniques using atomic Compare-And-Swap operations on a central version counter or the metadata of all items in the write-set to achieve an atomic validate-and-write phase without explicit locking.",
-        "Integrate the dual-counter metadata more deeply into the validation rule. The final version validates both counters for correctness, but a more novel (and complex) design might find a safe but more permissive rule, for example, by using timestamps to determine if a CMC change is relevant to a given transaction's snapshot."
-    ],
-    "confidence_0_to_1": 0.95
-}
-```
-```
+
 */
 
 
