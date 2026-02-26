@@ -1951,16 +1951,20 @@ public class Evaluator {
                 scenarioSummaries.put(entry.getKey(), entry.getValue().toMap());
             }
             Map<String, Double> tpccThroughputs = throughputs.entrySet().stream().filter(entry -> entry.getKey().startsWith("tpcc_")).collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
-            artifacts.put("tpcc_avg_throughputs",  tpccThroughputs.values().stream().mapToDouble(Double::doubleValue).average().orElse(0.0));
+
             Map<String, Double> auctionThroughputs = throughputs.entrySet().stream()
                     .filter(entry -> entry.getKey().startsWith("auction_"))
                     .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
-            if (!auctionThroughputs.isEmpty()) {
-                artifacts.put("auction_avg_throughput", auctionThroughputs.values().stream()
-                        .mapToDouble(Double::doubleValue).average().orElse(0.0));
-            }
+            
             artifacts.put("pre_known_txn_type", preKnownTxnType);
             artifacts.put("scenario_summaries", scenarioSummaries);
+
+            if (preKnownTxnType.equals("tpcc") && !tpccThroughputs.isEmpty()) {
+                artifacts.put("pre_known_transactions_avg_throughputs",  tpccThroughputs.values().stream().mapToDouble(Double::doubleValue).average().orElse(0.0));
+            }
+            else if (preKnownTxnType.equals("auction") && !auctionThroughputs.isEmpty()) {
+                artifacts.put("pre_known_transactions_avg_throughput", auctionThroughputs.values().stream().mapToDouble(Double::doubleValue).average().orElse(0.0));
+            }
 
             // Only add other metrics if not in correctness-only mode
             if (!correctnessOnly) {
