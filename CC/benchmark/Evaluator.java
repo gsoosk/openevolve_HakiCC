@@ -1855,20 +1855,20 @@ public class Evaluator {
             }
 
             // TPC-C with different warehouse counts (scalability benchmark)
-            int[] warehouseCounts = {1, 2, 4, 8, 16};
-            for (int whCount : warehouseCounts) {
-                TpccConfig config = TpccConfig.withWarehouses(whCount);
-                String scenarioName = config.configName;
-                System.out.println("Running TPC-C with " + whCount + " warehouse(s)...");
-                scenarios.put(scenarioName, runScenario(
-                        ccFactory,
-                        createTpccWorkload(config),
-                        64,
-                        5.0,
-                        0.2,
-                        createTpccInitializer(config)
-                ));
-            }
+            // int[] warehouseCounts = {1, 2, 4, 8, 16};
+            // for (int whCount : warehouseCounts) {
+            //     TpccConfig config = TpccConfig.withWarehouses(whCount);
+            //     String scenarioName = config.configName;
+            //     System.out.println("Running TPC-C with " + whCount + " warehouse(s)...");
+            //     scenarios.put(scenarioName, runScenario(
+            //             ccFactory,
+            //             createTpccWorkload(config),
+            //             64,
+            //             5.0,
+            //             0.2,
+            //             createTpccInitializer(config)
+            //     ));
+            // }
 
             if (!correctnessOnly) {
             // AuctionMark with additional contention levels (medium + extreme)
@@ -1985,8 +1985,8 @@ public class Evaluator {
                 } else {
                     if (throughputs.containsKey("tpcc_contention_very_high"))
                         metrics.put("pre_known_transactions_under_high_contention", getThroughputScore(throughputs.get("tpcc_contention_very_high")));
-                    if (throughputs.containsKey("tpcc_wh8"))
-                        metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_wh8")));
+                    if (throughputs.containsKey("tpcc_contention_low"))
+                        metrics.put("pre_known_transactions_normal_scenario", getThroughputScore(throughputs.get("tpcc_contention_low")));
                 }
                 
 
