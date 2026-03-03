@@ -1907,7 +1907,7 @@ public class Evaluator {
             int correct = 0;
             double totalThroughput = 0.0;
 
-            int preKnownCoefficient = 5;
+            int preKnownCoefficient = 2;
             int otherCoefficient = 1;
             int weightedScenarios = 0;
             String preKnownPrefix = preKnownTxnType.equals("auction") ? "auction" : "tpcc";
